@@ -322,7 +322,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
-    def forward(
+    def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -385,15 +385,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             offsets = self.ngram_heads_offsets[start:end]
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
-        ngram_ids = torch.cat(id_blocks, dim=-1)
+        return torch.cat(id_blocks, dim=-1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> torch.Tensor:
         embedding = self.ngram_embedding
+        ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         if embedding.supports_prefetch:
             output = ngram_ids.new_empty(
                 (ngram_ids.shape[0], self.embedding_dim),
                 dtype=embedding.weight.dtype,
             )
-            torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_pinned(
-                ngram_ids,
+            torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_finalize(
                 output,
                 self.layer_name,
             )
@@ -408,6 +415,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.layer_name,
         )
         return output
+
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Start the pinned PLE lookup while the preceding decoder layer runs."""
+        embedding = self.ngram_embedding
+        if not embedding.supports_prefetch:
+            return
+        ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+        torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
+            hidden_states,
+            ngram_ids,
+            self.layer_name,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -1086,6 +1111,21 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             conv_weights.to(dtype=inputs.dtype),
         )
 
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+    ) -> None:
+        """Start the pinned PLE lookup while the preceding decoder layer runs."""
+        self.ple_embedding.start_prefetch(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1142,9 +1182,9 @@ def qwen4_exp_amd_ple_ngram_embedding(
     output.copy_(result)
 
 
-def qwen4_exp_amd_ple_ngram_embedding_pinned(
+def qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
+    hidden_states: torch.Tensor,
     ngram_ids: torch.Tensor,
-    output: torch.Tensor,
     layer_name: str,
 ) -> None:
     """Run the pinned PLE UVA lookup outside Inductor's FX graph.
@@ -1156,8 +1196,19 @@ def qwen4_exp_amd_ple_ngram_embedding_pinned(
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpPLELayer):
         raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
-    result = layer.ple_embedding.ngram_embedding.sync_lookup(ngram_ids).flatten(-2)
-    output.copy_(result)
+    layer.ple_embedding.ngram_embedding.start_prefetch(hidden_states, ngram_ids)
+
+
+def qwen4_exp_amd_ple_ngram_embedding_finalize(
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Finish the pinned PLE UVA lookup outside Inductor's FX graph."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    if not isinstance(layer, Qwen4ExpPLELayer):
+        raise TypeError(f"{layer_name} is not a Qwen4Exp PLE owner")
+    embedding = layer.ple_embedding.ngram_embedding
+    embedding._finalize_prefetch(embedding._prefetch_buffer, output)
 
 
 def qwen4_exp_ple_short_conv(
@@ -1178,8 +1229,15 @@ direct_register_custom_op(
 
 
 direct_register_custom_op(
-    op_name="qwen4_exp_amd_ple_ngram_embedding_pinned",
-    op_func=qwen4_exp_amd_ple_ngram_embedding_pinned,
+    op_name="qwen4_exp_amd_ple_ngram_embedding_prefetch_start",
+    op_func=qwen4_exp_amd_ple_ngram_embedding_prefetch_start,
+    fake_impl=lambda *args, **kwargs: None,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple_ngram_embedding_finalize",
+    op_func=qwen4_exp_amd_ple_ngram_embedding_finalize,
     mutates_args=["output"],
 )
 
