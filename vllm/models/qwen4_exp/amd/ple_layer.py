@@ -431,6 +431,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
             hidden_states,
             ngram_ids,
+            embedding._prefetch_buffer,
             self.layer_name,
         )
 
@@ -1185,13 +1186,16 @@ def qwen4_exp_amd_ple_ngram_embedding(
 def qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
     hidden_states: torch.Tensor,
     ngram_ids: torch.Tensor,
+    output: torch.Tensor,
     layer_name: str,
 ) -> None:
     """Run the pinned PLE UVA lookup outside Inductor's FX graph.
 
-    Same rationale as the device-path escape: keeping the large embedding weight
-    out of the graph prevents AOT compile-time autotuning from materializing a
-    synthetic copy of the weight.
+    ``output`` is the prefetch buffer; declaring it mutated keeps the call in the
+    compiled graph (a pure ``None``-returning op would be dead-code-eliminated,
+    leaving ``finalize`` to read a buffer that was never written). Keeping the large
+    embedding weight out of the graph prevents AOT compile-time autotuning from
+    materializing a bf16 copy of the table.
     """
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpPLELayer):
@@ -1231,6 +1235,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="qwen4_exp_amd_ple_ngram_embedding_prefetch_start",
     op_func=qwen4_exp_amd_ple_ngram_embedding_prefetch_start,
+    mutates_args=["output"],
     fake_impl=lambda *args, **kwargs: None,
 )
 

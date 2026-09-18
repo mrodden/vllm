@@ -19,6 +19,10 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4Config,
 )
+from vllm.models.qwen4_exp.amd import ple_layer as amd_ple_layer
+from vllm.models.qwen4_exp.amd.ple_layer import (
+    Qwen4ExpPLELayer as Qwen4ExpPLELayerAMD,
+)
 from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     compute_ple_shard_overlap,
@@ -592,6 +596,86 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
     torch.testing.assert_close(
         dequantized,
         expected.to(torch.bfloat16) * expected_scale,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_amd_pinned_prefetch_buffer_written_under_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AMD prefetch_start custom op must survive aot_autograd/Inductor.
+
+    The op returns ``None`` and only writes via the declared-mutated ``output``
+    (the prefetch buffer). Without ``mutates_args=["output"]`` the call is
+    dead-code-eliminated and the buffer is never written, leaving ``finalize`` to
+    copy stale data.
+    """
+    _mock_etp_group(monkeypatch)
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    layer_name = "test.ple"
+    layer = Qwen4ExpPLELayerAMD.__new__(Qwen4ExpPLELayerAMD)
+    nn.Module.__init__(layer)
+    with torch.device("cuda:0"):
+        embedding = Qwen4ExpPLEPinnedHostEmbedding(
+            4,
+            3,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            prefix="test.ple_embedding",
+            embedding_method=Qwen4ExpPLEUnquantizedEmbeddingMethod(),
+            num_ngram_heads=2,
+            max_total_tokens=4,
+        )
+    layer.ple_embedding = SimpleNamespace(ngram_embedding=embedding)
+
+    monkeypatch.setattr(
+        amd_ple_layer,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={layer_name: layer}),
+    )
+
+    loaded_weight = (
+        torch.arange(12, dtype=torch.float32).reshape(4, 3).to(torch.bfloat16)
+    )
+    copy_ple_embedding_shard_(
+        embedding.weight,
+        loaded_weight,
+        checkpoint_start=0,
+        tp_start=0,
+        tp_end=4,
+    )
+    embedding.quant_method.process_weights_after_loading(embedding)
+
+    input_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
+    hidden_states = torch.zeros(input_ids.shape[0], 3, device="cuda:0")
+    embedding._prefetch_buffer.zero_()
+
+    compiled = torch.compile(
+        lambda h,
+        ids,
+        output: torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
+            h,
+            ids,
+            output,
+            layer_name,
+        )
+    )
+    compiled(hidden_states, input_ids, embedding._prefetch_buffer)
+    torch.cuda.current_stream().synchronize()
+
+    expected = loaded_weight[input_ids.cpu()].to(device="cuda:0")
+    torch.testing.assert_close(
+        embedding._prefetch_buffer[: input_ids.shape[0]].float(),
+        expected.float(),
         rtol=0,
         atol=0,
     )
