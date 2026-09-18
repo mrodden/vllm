@@ -658,27 +658,34 @@ def test_amd_pinned_prefetch_buffer_written_under_compile(
     input_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
     hidden_states = torch.zeros(input_ids.shape[0], 3, device="cuda:0")
     embedding._prefetch_buffer.zero_()
+    finalized = torch.empty(
+        input_ids.shape[0],
+        2 * 3,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
 
-    compiled = torch.compile(
-        lambda h,
-        ids,
-        output: torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
-            h,
-            ids,
-            output,
+    def prefetch_and_finalize(
+        hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_prefetch_start(
+            hidden_states,
+            input_ids,
+            embedding._prefetch_buffer,
             layer_name,
         )
-    )
-    compiled(hidden_states, input_ids, embedding._prefetch_buffer)
+        torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_finalize(
+            finalized,
+            layer_name,
+        )
+        return finalized
+
+    compiled = torch.compile(prefetch_and_finalize)
+    compiled(hidden_states, input_ids)
     torch.cuda.current_stream().synchronize()
 
-    expected = loaded_weight[input_ids.cpu()].to(device="cuda:0")
-    torch.testing.assert_close(
-        embedding._prefetch_buffer[: input_ids.shape[0]].float(),
-        expected.float(),
-        rtol=0,
-        atol=0,
-    )
+    expected = loaded_weight[input_ids.cpu()].to(device="cuda:0").flatten(-2)
+    torch.testing.assert_close(finalized.float(), expected.float(), rtol=0, atol=0)
 
 
 def test_ple_fp8_embedding_supports_mixed_precision_config() -> None:
