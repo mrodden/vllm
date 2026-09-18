@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
-import vllm.models.qwen4_exp.nvidia.ngram_embedding as ngram_embedding_module
+import vllm.models.qwen4_exp.common.ngram_embedding as ngram_embedding_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
