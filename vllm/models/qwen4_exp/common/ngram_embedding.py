@@ -505,10 +505,18 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         hidden_states: torch.Tensor,
         ngram_ids: torch.Tensor,
     ) -> None:
-        """Gather ETP IDs and launch their UVA lookup on the side stream."""
+        """Gather ETP IDs and launch their UVA lookup on the side stream.
+
+        Inside a cudagraph capture a side-stream launch would leave the capture
+        stream with unjoined work (hipErrorStreamCaptureUnjoined), so fall back
+        to a synchronous lookup on the capture stream instead.
+        """
         slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
         active_output = self._prefetch_buffer[: gathered_ids.shape[0]]
+        if torch.cuda.is_current_stream_capturing():
+            self._lookup(gathered_ids, output=active_output)
+            return
         prefetch_stream = self._prefetch_stream
         prefetch_stream.wait_stream(torch.cuda.current_stream())
         gathered_ids.record_stream(prefetch_stream)
@@ -522,7 +530,8 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         output: torch.Tensor,
     ) -> None:
         """Join the side stream, reduce ETP shards, and select local rows."""
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        if not torch.cuda.is_current_stream_capturing():
+            torch.cuda.current_stream().wait_stream(self._prefetch_stream)
         slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])
         active_output = prefetch_output[: slot_size * self.etp_data_parallel_size]
         embeddings = self._reduce_etp_embeddings(active_output)

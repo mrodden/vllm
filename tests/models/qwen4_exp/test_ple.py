@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
@@ -601,16 +602,10 @@ def test_ple_pinned_embedding_loads_on_cpu_and_looks_up_through_uva(
     )
 
 
-def test_amd_pinned_prefetch_buffer_written_under_compile(
+def _build_amd_pinned_layer(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The AMD prefetch_start custom op must survive aot_autograd/Inductor.
-
-    The op returns ``None`` and only writes via the declared-mutated ``output``
-    (the prefetch buffer). Without ``mutates_args=["output"]`` the call is
-    dead-code-eliminated and the buffer is never written, leaving ``finalize`` to
-    copy stale data.
-    """
+) -> tuple[str, Qwen4ExpPLELayerAMD, Qwen4ExpPLEPinnedHostEmbedding, torch.Tensor]:
+    """Build an AMD PLE layer backed by a small pinned (UVA) embedding."""
     _mock_etp_group(monkeypatch)
     monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -654,17 +649,14 @@ def test_amd_pinned_prefetch_buffer_written_under_compile(
         tp_end=4,
     )
     embedding.quant_method.process_weights_after_loading(embedding)
+    return layer_name, layer, embedding, loaded_weight
 
-    input_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
-    hidden_states = torch.zeros(input_ids.shape[0], 3, device="cuda:0")
-    embedding._prefetch_buffer.zero_()
-    finalized = torch.empty(
-        input_ids.shape[0],
-        2 * 3,
-        dtype=torch.bfloat16,
-        device="cuda:0",
-    )
 
+def _amd_prefetch_and_finalize(
+    embedding: Qwen4ExpPLEPinnedHostEmbedding,
+    finalized: torch.Tensor,
+    layer_name: str,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     def prefetch_and_finalize(
         hidden_states: torch.Tensor, input_ids: torch.Tensor
     ) -> torch.Tensor:
@@ -680,8 +672,74 @@ def test_amd_pinned_prefetch_buffer_written_under_compile(
         )
         return finalized
 
+    return prefetch_and_finalize
+
+
+def test_amd_pinned_prefetch_buffer_written_under_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AMD prefetch_start custom op must survive aot_autograd/Inductor.
+
+    The op returns ``None`` and only writes via the declared-mutated ``output``
+    (the prefetch buffer). Without ``mutates_args=["output"]`` the call is
+    dead-code-eliminated and the buffer is never written, leaving ``finalize`` to
+    copy stale data.
+    """
+    layer_name, _, embedding, loaded_weight = _build_amd_pinned_layer(monkeypatch)
+
+    input_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
+    hidden_states = torch.zeros(input_ids.shape[0], 3, device="cuda:0")
+    embedding._prefetch_buffer.zero_()
+    finalized = torch.empty(
+        input_ids.shape[0],
+        2 * 3,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+    prefetch_and_finalize = _amd_prefetch_and_finalize(embedding, finalized, layer_name)
+
     compiled = torch.compile(prefetch_and_finalize)
     compiled(hidden_states, input_ids)
+    torch.cuda.current_stream().synchronize()
+
+    expected = loaded_weight[input_ids.cpu()].to(device="cuda:0").flatten(-2)
+    torch.testing.assert_close(finalized.float(), expected.float(), rtol=0, atol=0)
+
+
+def test_amd_pinned_prefetch_survives_cudagraph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prefetch_start must be capture-safe: no cross-stream work inside capture.
+
+    Inside a cudagraph capture the prefetch falls back to a lookup on the capture
+    stream (no side stream), so capture_end has no unjoined work and finalize
+    copies the written buffer. Without the fallback this reproduces
+    hipErrorStreamCaptureUnjoined on ROCm.
+    """
+    layer_name, _, embedding, loaded_weight = _build_amd_pinned_layer(monkeypatch)
+
+    input_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
+    hidden_states = torch.zeros(input_ids.shape[0], 3, device="cuda:0")
+    embedding._prefetch_buffer.zero_()
+    finalized = torch.empty(
+        input_ids.shape[0],
+        2 * 3,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+    prefetch_and_finalize = _amd_prefetch_and_finalize(embedding, finalized, layer_name)
+
+    graph = torch.cuda.CUDAGraph()
+    warmup_stream = torch.cuda.Stream(device="cuda:0")
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            prefetch_and_finalize(hidden_states, input_ids)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    with torch.cuda.graph(graph):
+        prefetch_and_finalize(hidden_states, input_ids)
+    graph.replay()
     torch.cuda.current_stream().synchronize()
 
     expected = loaded_weight[input_ids.cpu()].to(device="cuda:0").flatten(-2)
