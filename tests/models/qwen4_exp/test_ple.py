@@ -709,12 +709,12 @@ def test_amd_pinned_prefetch_buffer_written_under_compile(
 def test_amd_pinned_prefetch_survives_cudagraph_capture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """prefetch_start must be capture-safe: no cross-stream work inside capture.
+    """prefetch_start + finalize must be capture-safe in monolithic captures.
 
-    Inside a cudagraph capture the prefetch falls back to a lookup on the capture
-    stream (no side stream), so capture_end has no unjoined work and finalize
-    copies the written buffer. Without the fallback this reproduces
-    hipErrorStreamCaptureUnjoined on ROCm.
+    Inside a monolithic cudagraph capture the prefetch falls back to a lookup
+    on the capture stream (no side stream), so capture_end has no unjoined
+    work and finalize copies the written buffer. Dropping the fallback
+    reproduces hipErrorStreamCaptureUnjoined on ROCm.
     """
     layer_name, _, embedding, loaded_weight = _build_amd_pinned_layer(monkeypatch)
 
@@ -1864,3 +1864,84 @@ def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
     expected_normed = grouped_norm(expected_gated, norm_conv)
     assert torch.equal(gated, expected_gated)
     torch.testing.assert_close(normed, expected_normed, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_amd_pinned_prefetch_eager_break_under_breakable_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AMD prefetch/finalize ops must be eager breaks under breakable capture.
+
+    The op bodies read the forward context and stream state per step; without
+    ``@eager_break_during_capture`` the host-side dispatch is frozen into a
+    captured segment and replay reuses stale embeddings. Under
+    ``BreakableCUDAGraphCapture`` both ops must run eagerly at capture time and
+    re-execute on every replay, re-deriving ``finalized`` from the current
+    ``input_ids`` through the side-stream fork/join.
+    """
+    import vllm.envs as envs
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    # The decorator reads VLLM_USE_BREAKABLE_CUDAGRAPH at decoration time,
+    # which happens at module import; set the env first and decorate the op
+    # bodies afresh (mirroring the breakable-cudagraph tests' fixture).
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    envs.disable_envs_cache()
+
+    layer_name, _, embedding, loaded_weight = _build_amd_pinned_layer(monkeypatch)
+
+    start_op = amd_ple_layer.eager_break_during_capture(
+        amd_ple_layer.qwen4_exp_amd_ple_ngram_embedding_prefetch_start
+    )
+    finalize_op = amd_ple_layer.eager_break_during_capture(
+        amd_ple_layer.qwen4_exp_amd_ple_ngram_embedding_finalize
+    )
+
+    input_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
+    hidden_states = torch.zeros(input_ids.shape[0], 3, device="cuda:0")
+    embedding._prefetch_buffer.zero_()
+    finalized = torch.empty(
+        input_ids.shape[0],
+        2 * 3,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+
+    def prefetch_and_finalize(
+        hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        start_op(
+            hidden_states,
+            input_ids,
+            embedding._prefetch_buffer,
+            layer_name,
+        )
+        finalize_op(finalized, layer_name)
+        return finalized
+
+    capture_stream = torch.cuda.Stream(device="cuda:0")
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            prefetch_and_finalize(hidden_states, input_ids)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    capture = BreakableCUDAGraphCapture()
+    with torch.cuda.stream(capture_stream), capture:
+        prefetch_and_finalize(hidden_states, input_ids)
+    assert capture.num_eager_breaks == 2, (
+        "both PLE prefetch ops must register as eager breaks; if this fails, "
+        "@eager_break_during_capture was removed from "
+        "qwen4_exp_amd_ple_ngram_embedding_prefetch_start or _finalize"
+    )
+
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    vocab = loaded_weight.shape[0]
+    for _ in range(2):
+        input_ids.copy_((input_ids.flip(-1) + 1) % vocab)
+        finalized.fill_(float("nan"))
+        capture.replay()
+        torch.cuda.current_stream().synchronize()
+
+        expected = loaded_weight[input_ids.cpu()].to(device="cuda:0").flatten(-2)
+        torch.testing.assert_close(finalized.float(), expected.float(), rtol=0, atol=0)

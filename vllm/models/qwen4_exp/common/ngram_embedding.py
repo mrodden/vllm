@@ -507,14 +507,21 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
     ) -> None:
         """Gather ETP IDs and launch their UVA lookup on the side stream.
 
-        Inside a cudagraph capture a side-stream launch would leave the capture
-        stream with unjoined work (hipErrorStreamCaptureUnjoined), so fall back
-        to a synchronous lookup on the capture stream instead.
+        Inside a monolithic cudagraph capture a side-stream launch would leave
+        the capture stream with unjoined work (hipErrorStreamCaptureUnjoined on
+        ROCm), so fall back to a synchronous lookup on the capture stream
+        instead. Under breakable cudagraphs this op runs inside an eager break
+        (not capturing), so the side-stream prefetch still runs there.
         """
         slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
         active_output = self._prefetch_buffer[: gathered_ids.shape[0]]
         if torch.cuda.is_current_stream_capturing():
+            # Monolithic cudagraph capture: a side-stream launch would leave
+            # the capture stream with unjoined work (hipErrorStreamCaptureUnjoined
+            # on ROCm), so fall back to a synchronous lookup on the capture
+            # stream. Under breakable cudagraphs this op runs inside an eager
+            # break (not capturing), so the side-stream prefetch still runs.
             self._lookup(gathered_ids, output=active_output)
             return
         prefetch_stream = self._prefetch_stream
