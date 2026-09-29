@@ -1928,3 +1928,75 @@ def test_amd_pinned_embedding_output_written_under_cudagraph_capture(
 
         expected = loaded_weight[ngram_ids.cpu()].to(device="cuda:0").flatten(-2)
         torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fp8_checkpoint", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_amd_pinned_embedding_replay_redoes_lookup_under_breakable_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    fp8_checkpoint: bool,
+) -> None:
+    """The AMD pinned lookup op must be an eager break under breakable capture.
+
+    The op body reads the forward context (``no_compile_layers``) and derives
+    per-step results; without ``@eager_break_during_capture`` the host-side
+    dispatch is frozen into a captured segment and replay reuses stale work.
+    Under ``BreakableCUDAGraphCapture`` the op must run eagerly at capture
+    time and re-execute on every replay, re-deriving ``output`` from the
+    current ``ngram_ids``.
+    """
+    import vllm.envs as envs
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    # The decorator reads VLLM_USE_BREAKABLE_CUDAGRAPH at decoration time,
+    # which happens at module import; set the env first and decorate the op
+    # body afresh (mirroring the breakable-cudagraph tests' fixture).
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    envs.disable_envs_cache()
+
+    module, loaded_weight = _build_amd_ngram_embedding(
+        monkeypatch, device="cuda:0", cpu_offload=True, fp8_checkpoint=fp8_checkpoint
+    )
+
+    pinned_op = amd_ple_layer.eager_break_during_capture(
+        amd_ple_layer.qwen4_exp_amd_ple_ngram_embedding_pinned
+    )
+
+    ngram_ids = torch.tensor([[3, 0], [1, 2]], device="cuda:0")
+    output = torch.zeros(
+        ngram_ids.shape[0],
+        module.embedding_dim,
+        dtype=module.ngram_embedding.weight.dtype,
+        device="cuda:0",
+    )
+
+    def lookup(ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        pinned_op(ids, out, module.layer_name)
+        return out
+
+    capture_stream = torch.cuda.Stream(device="cuda:0")
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            lookup(ngram_ids, output)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    capture = BreakableCUDAGraphCapture()
+    with torch.cuda.stream(capture_stream), capture:
+        lookup(ngram_ids, output)
+    assert capture.num_eager_breaks == 1, (
+        "the pinned PLE lookup op must register as an eager break; "
+        "if this fails, @eager_break_during_capture was removed from "
+        "qwen4_exp_amd_ple_ngram_embedding_pinned"
+    )
+
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    vocab = loaded_weight.shape[0]
+    for _ in range(2):
+        ngram_ids.copy_((ngram_ids.flip(-1) + 1) % vocab)
+        output.fill_(float("nan"))
+        capture.replay()
+        torch.cuda.current_stream().synchronize()
+
+        expected = loaded_weight[ngram_ids.cpu()].to(device="cuda:0").flatten(-2)
+        torch.testing.assert_close(output.float(), expected.float(), rtol=0, atol=0)
