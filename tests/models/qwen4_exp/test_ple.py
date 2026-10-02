@@ -1099,6 +1099,87 @@ def test_fused_ngram_ids_correctness(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs CUDA")
+@pytest.mark.parametrize(
+    ("query_lens", "eos_offsets", "contexts", "first_token_id"),
+    [
+        ([1], [], [[11, 12]], 20),
+        ([3], [1], [[11]], 20),
+        ([4, 4], [0, 7], [[11, 12], [13, 14]], 20),
+        ([4, 0, 3], [], [[11, 12], [13, 14], [15, 16]], 20),
+        (
+            [3, 2, 0, 0],
+            [],
+            [
+                [11, 12],
+                [13, 14],
+                [_NGRAM_EOS_TOKEN_ID, _NGRAM_EOS_TOKEN_ID],
+                [_NGRAM_EOS_TOKEN_ID, _NGRAM_EOS_TOKEN_ID],
+            ],
+            20,
+        ),
+        (
+            [1, 33, 2],
+            [5, 32],
+            [[_NGRAM_EOS_TOKEN_ID, 11], [12, 13], [14, _NGRAM_EOS_TOKEN_ID]],
+            20,
+        ),
+        (
+            [5, 12, 16, 1, 16, 17],
+            [10, 40],
+            [[11, 12], [13, 14], [15, 16], [17, 18], [19, 20], [21, 22]],
+            20,
+        ),
+        ([5, 3], [3], [[11, 12, 13], [14, 15, 16]], 20),
+    ],
+    ids=[
+        "single-token",
+        "bigram-eos",
+        "two-requests-eos",
+        "empty-request",
+        "trailing-padded-requests",
+        "eos-context-boundary",
+        "six-requests",
+        "four-gram",
+    ],
+)
+def test_amd_fused_ngram_ids_matches_nvidia(
+    query_lens: list[int],
+    eos_offsets: list[int],
+    contexts: list[list[int]],
+    first_token_id: int,
+) -> None:
+    """The AMD-path fused n-gram id kernel must match the NVIDIA one.
+
+    Both kernels are ports of the same math; this guards the copy against
+    drift and against layout mistakes in the AMD wiring.
+    """
+    from vllm.models.qwen4_exp.amd.ops.ple import ple_ngram_ids as amd_ple_ngram_ids
+    from vllm.models.qwen4_exp.nvidia.ops.ple import ple_ngram_ids as nv_ple_ngram_ids
+
+    device = torch.device("cuda")
+    query_start_loc = torch.tensor(
+        [0, *accumulate(query_lens)], dtype=torch.int32, device=device
+    )
+    input_ids = torch.arange(
+        first_token_id,
+        first_token_id + sum(query_lens),
+        dtype=torch.int32,
+        device=device,
+    )
+    if eos_offsets:
+        input_ids[eos_offsets] = _NGRAM_EOS_TOKEN_ID
+    ngram_context = torch.tensor(contexts, dtype=torch.int32, device=device)
+    params = _ngram_hash_params(device, ngram_context.shape[1])
+
+    expected = _reference_ngram_ids(input_ids, query_start_loc, ngram_context, **params)
+    amd_actual = amd_ple_ngram_ids(input_ids, query_start_loc, ngram_context, **params)
+    nv_actual = nv_ple_ngram_ids(input_ids, query_start_loc, ngram_context, **params)
+
+    assert torch.equal(amd_actual, expected)
+    assert torch.equal(amd_actual, nv_actual)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs CUDA")
 def test_ngram_prefetch_ids_outlive_start_prefetch() -> None:
     """Eager breaks hand the side-stream lookup weak refs, so the ids must stay
     valid after start_prefetch returns rather than be reused from the pool."""
