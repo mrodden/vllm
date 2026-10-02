@@ -32,7 +32,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from .ops.ple import ple_ngram_ids
+from .ops.ple import ple_conv, ple_ngram_ids
 from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
@@ -1056,6 +1056,146 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return x
         return conv_out_non_spec
 
+    def _short_conv_dilated_dispatch_fused(
+        self,
+        inputs: torch.Tensor,
+        metadata: PleShortConvAttentionMetadata,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused triton short-conv dispatch (ported from the NVIDIA path).
+
+        The NVIDIA kernels accumulate ``silu(conv)`` into a residual/outer
+        pair in place. The AMD PLE contract returns the conv output alone
+        (the caller adds it to the gated value), so both accumulators are
+        zero-filled: the kernels then write exactly the conv output rows,
+        in the original token order, into ``output``. Both accumulator
+        arguments alias ``output``; the kernel loads each row before
+        storing it, so the aliasing is safe (both loads read the same
+        zeros and only the sum is stored).
+        """
+        num_prefills = metadata.num_prefills
+        num_decodes = metadata.num_decodes
+        num_decode_tokens = metadata.num_decode_tokens
+        num_prefill_tokens = metadata.num_prefill_tokens
+        has_prefill = num_prefills > 0
+        has_decode = num_decodes > 0
+        has_spec = metadata.spec_sequence_masks is not None
+        has_non_spec = has_prefill or has_decode
+        num_actual = metadata.num_actual_tokens
+        x = inputs[:num_actual]
+        output = torch.zeros_like(x)
+
+        spec_token_indices = None
+        non_spec_token_indices = None
+        if has_spec and has_non_spec:
+            assert metadata.spec_token_indx is not None
+            assert metadata.non_spec_token_indx is not None
+            spec_token_indices = metadata.spec_token_indx
+            non_spec_token_indices = metadata.non_spec_token_indx
+
+        if has_spec:
+            assert metadata.spec_state_indices_tensor is not None
+            assert metadata.spec_query_start_loc is not None
+            assert metadata.num_accepted_tokens is not None
+            spec_state_indices = metadata.spec_state_indices_tensor[
+                : metadata.num_spec_decodes
+            ]
+            # Mixed batches stay in their original row order; the kernels map
+            # logical spec/non-spec rows instead of materializing both groups.
+            ple_conv(
+                inputs=x,
+                residual=output,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices=spec_state_indices,
+                outer_residual=output,
+                mode="spec",
+                dilation=self.short_conv_dilation,
+                query_start_loc=metadata.spec_query_start_loc,
+                num_accepted_tokens=metadata.num_accepted_tokens,
+                spec_query_len=metadata.spec_query_len,
+                token_indices=spec_token_indices,
+            )
+
+        if not has_non_spec:
+            return output
+
+        state_indices = metadata.state_indices_tensor
+        assert state_indices is not None
+        if has_prefill:
+            state_indices_d, state_indices_p = torch.split(
+                state_indices, [num_decodes, num_prefills], dim=0
+            )
+            if non_spec_token_indices is None:
+                x_d, x_p = torch.split(
+                    x, [num_decode_tokens, num_prefill_tokens], dim=0
+                )
+                token_indices_d = None
+                token_indices_p = None
+            else:
+                x_d = x_p = x
+                token_indices_d, token_indices_p = torch.split(
+                    non_spec_token_indices,
+                    [num_decode_tokens, num_prefill_tokens],
+                    dim=0,
+                )
+
+            if has_decode:
+                ple_conv(
+                    inputs=x_d,
+                    residual=output,
+                    conv_state=conv_state,
+                    conv_weights=conv_weights,
+                    state_indices=state_indices_d,
+                    outer_residual=output,
+                    mode="decode",
+                    dilation=self.short_conv_dilation,
+                    has_initial_states=metadata.has_initial_states_d,
+                    token_indices=token_indices_d,
+                )
+
+            query_start_loc = metadata.query_start_loc_p
+            if query_start_loc is None:
+                raise ValueError("query_start_loc is required for prefill short-conv")
+            has_initial_states = metadata.has_initial_states_p
+            if has_initial_states is None:
+                raise ValueError(
+                    "has_initial_states_p is required for prefill short-conv"
+                )
+            ple_conv(
+                inputs=x_p,
+                residual=output,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices=state_indices_p,
+                outer_residual=output,
+                mode="prefill",
+                dilation=self.short_conv_dilation,
+                query_start_loc=query_start_loc,
+                has_initial_states=has_initial_states,
+                token_indices=token_indices_p,
+            )
+        else:
+            num_decode_rows = (
+                non_spec_token_indices.numel()
+                if non_spec_token_indices is not None
+                else x.size(0)
+            )
+            ple_conv(
+                inputs=x,
+                residual=output,
+                conv_state=conv_state,
+                conv_weights=conv_weights,
+                state_indices=state_indices[:num_decode_rows],
+                outer_residual=output,
+                mode="decode",
+                dilation=self.short_conv_dilation,
+                has_initial_states=metadata.has_initial_states_d,
+                token_indices=non_spec_token_indices,
+            )
+        return output
+
     def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
@@ -1093,6 +1233,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     f"expect at least {state_capacity}."
                 )
             conv_state = conv_state[..., -state_capacity:]
+        if inputs.is_cuda:
+            return self._short_conv_dilated_dispatch_fused(
+                inputs, layer_attn_metadata, conv_state, conv_weights.to(
+                    dtype=inputs.dtype
+                )
+            )
         return self._short_conv_dilated_dispatch(
             inputs,
             layer_attn_metadata,

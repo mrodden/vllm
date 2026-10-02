@@ -1984,6 +1984,129 @@ def test_fused_conv_correctness(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused conv needs CUDA")
+@pytest.mark.parametrize("state_layout", ["SD", "DS"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(_ConvBatchCase(num_decodes=1, channels=512), id="decode-single"),
+        pytest.param(
+            _ConvBatchCase(
+                num_decodes=33, channels=2048, kernel_size=5, dilation=1
+            ),
+            id="decode-padded",
+        ),
+        pytest.param(_ConvBatchCase(prefill_query_lens=(37, 0, 5, 128)), id="prefill"),
+        pytest.param(
+            _ConvBatchCase(
+                prefill_query_lens=(16, 676),
+                channels=10240,
+                state_index_stride=4,
+                include_null_state=False,
+            ),
+            id="prefill-strided-state-indices",
+        ),
+        pytest.param(
+            _ConvBatchCase(
+                spec_query_lens=(1, 4, 4, 0),
+                num_accepted=(1, 2, 4, 1),
+                spec_query_len=4,
+                graph_padding=4,
+            ),
+            id="spec-graph-padded",
+        ),
+        pytest.param(
+            _ConvBatchCase(
+                spec_query_lens=(3, 4),
+                num_accepted=(2, 4),
+                num_decodes=1,
+                prefill_query_lens=(5,),
+                spec_query_len=4,
+            ),
+            id="mixed",
+        ),
+        pytest.param(
+            _ConvBatchCase(
+                spec_query_lens=(1, 2),
+                num_accepted=(0, 1),
+                num_decodes=2,
+                prefill_query_lens=(0, 8, 3),
+                channels=640,
+                kernel_size=3,
+                dilation=2,
+                spec_query_len=3,
+            ),
+            id="mixed-varied",
+        ),
+    ],
+)
+def test_amd_fused_conv_correctness(
+    case: _ConvBatchCase,
+    state_layout: str,
+) -> None:
+    """The AMD-path fused short-conv dispatch must match the eager reference.
+
+    The AMD PLE contract returns ``silu(conv)`` rows only (the caller adds
+    them to the gated value), so the reference is the pytorch dispatch's
+    conv output before its residual/outer accumulation.
+    """
+    device = torch.device("cuda")
+    metadata, num_real_tokens = _make_conv_metadata(case, device)
+    module = Qwen4ExpPLELayerAMD.__new__(Qwen4ExpPLELayerAMD)
+    nn.Module.__init__(module)
+    module.conv_state_len = (case.kernel_size - 1) * case.dilation
+    module.short_conv_dilation = case.dilation
+
+    rng, state_reference, conv_state, weights = _make_conv_case(
+        device,
+        seed=num_real_tokens + case.channels,
+        channels=case.channels,
+        kernel_size=case.kernel_size,
+        dilation=case.dilation,
+        state_layout=state_layout,
+        spec_query_len=case.spec_query_len,
+    )
+    inputs = torch.randn(
+        metadata.num_actual_tokens,
+        case.channels,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=rng,
+    )
+    residual_probe = torch.randn(inputs.shape, device=device, dtype=torch.bfloat16,
+                                 generator=rng)
+    null_state = conv_state[NULL_BLOCK_ID].clone()
+
+    # AMD fused dispatch: conv output only, original row order.
+    amd_output = module._short_conv_dilated_dispatch_fused(
+        inputs=inputs,
+        metadata=metadata,
+        conv_state=conv_state,
+        conv_weights=weights,
+    )
+
+    # Reference: pytorch dispatch accumulated into a zero residual; its
+    # conv contribution is isolated by running it once with residual=0 and
+    # outer=0 semantics (the reference adds residual in place).
+    residual_reference = torch.zeros_like(inputs)
+    _short_conv_dilated_dispatch_pytorch(
+        inputs=inputs,
+        residual=residual_reference,
+        metadata=metadata,
+        conv_state=state_reference,
+        conv_weights=weights,
+        conv_state_len=module.conv_state_len,
+        dilation=module.short_conv_dilation,
+    )
+
+    assert torch.equal(
+        amd_output[:num_real_tokens], residual_reference[:num_real_tokens]
+    )
+    assert torch.equal(conv_state, state_reference)
+    assert torch.equal(conv_state[NULL_BLOCK_ID], null_state)
+    assert residual_probe is not None  # silence lint on unused probe
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused gate needs CUDA")
 @pytest.mark.parametrize(("num_tokens", "strided_kv"), [(1, False), (64, True)])
 def test_fused_gate_correctness(num_tokens: int, strided_kv: bool) -> None:
