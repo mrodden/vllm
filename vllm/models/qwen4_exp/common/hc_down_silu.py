@@ -187,84 +187,53 @@ def _hc_down_silu_dot_kernel(
 def _hc_down_silu_epilogue_kernel(
     part_ptr,
     lora_ptr,
-    M,
-    RANK: tl.constexpr,
-    HC: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    launch_pdl: tl.constexpr,
-):
-    """Reduce split-K partials and write the SiLU'd lora columns."""
-    pid = tl.program_id(0)
-    m_offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offs = tl.arange(0, BLOCK_N)
-    m_mask = m_offs < M
-    n_mask = n_offs < RANK
-    N: tl.constexpr = RANK + HC
-
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-
-    acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
-    for k in tl.static_range(SPLIT_K):
-        p = tl.load(
-            part_ptr + (k * M + m_offs[:, None]) * N + n_offs[None, :],
-            mask=m_mask[:, None] & n_mask[None, :],
-            other=0.0,
-        )
-        acc += p
-
-    # Production rounding boundary: bf16 GEMM output, fp32 SiLU.
-    acc_bf16 = acc.to(tl.bfloat16).to(tl.float32)
-    silu_in = acc_bf16 / HC
-    epilog = (silu_in * tl.sigmoid(silu_in)).to(tl.bfloat16)
-
-    tl.store(
-        lora_ptr + m_offs[:, None] * RANK + n_offs[None, :],
-        epilog,
-        mask=m_mask[:, None] & n_mask[None, :],
-    )
-    if launch_pdl:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-@triton.jit
-def _hc_down_silu_inj_kernel(
-    part_ptr,
     inj_ptr,
     M,
     RANK: tl.constexpr,
     HC: tl.constexpr,
     SPLIT_K: tl.constexpr,
-    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
-    """Reduce split-K partials for the injection-logit columns (passthrough).
+    """Reduce split-K partials per row; SiLU lora, passthrough injection.
 
-    Kept as its own tiny kernel: a [BLOCK_M, BLOCK_N]-wide masked store into
-    a [M, HC] tensor with HC << BLOCK_N proved unreliable across triton
-    layouts (rows silently unwritten), while the row-program formulation is
-    trivially correct.
+    Row-program formulation for both outputs: the earlier wide-masked
+    [BLOCK_M, BLOCK_N] store into a [M, HC] tensor silently dropped rows
+    for some triton layouts, so each row is one program with 1-D stores.
     """
     row = tl.program_id(0)
-    offs_hc = tl.arange(0, BLOCK_H)
-    mask_hc = offs_hc < HC
-    N: tl.constexpr = RANK + HC
+    n_offs = tl.arange(0, BLOCK_N)
+    n_mask = n_offs < RANK + HC
+    NN: tl.constexpr = RANK + HC
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
-    acc = tl.zeros([BLOCK_H], tl.float32)
+    acc = tl.zeros([BLOCK_N], tl.float32)
     for k in tl.static_range(SPLIT_K):
-        p = tl.load(
-            part_ptr + (k * M + row) * N + RANK + offs_hc,
-            mask=mask_hc,
+        acc += tl.load(
+            part_ptr + (k * M + row) * NN + n_offs,
+            mask=n_mask,
             other=0.0,
         )
-        acc += p
 
-    tl.store(inj_ptr + row * HC + offs_hc, acc.to(tl.bfloat16), mask=mask_hc)
+    # Production rounding boundary: bf16 GEMM output, fp32 SiLU.
+    acc_bf16 = acc.to(tl.bfloat16).to(tl.float32)
+    is_lora = n_offs < RANK
+    silu_in = acc_bf16 / HC
+    epilog = tl.where(is_lora, silu_in * tl.sigmoid(silu_in), acc_bf16)
+    epilog = epilog.to(tl.bfloat16)
+
+    tl.store(
+        lora_ptr + row * RANK + n_offs,
+        epilog,
+        mask=n_mask & is_lora,
+    )
+    tl.store(
+        inj_ptr + row * HC + (n_offs - RANK),
+        epilog,
+        mask=n_mask & (~is_lora),
+    )
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -283,9 +252,12 @@ def _hc_down_silu(
     w = weight[:n_compute]
     launch_pdl = current_platform.is_arch_support_pdl()
 
-    if M <= 4:
-        BLOCK_N = 32
-        BLOCK_K = 256
+    if M <= 8:
+        # Small-n / large-K tiling: many CTAs (81 for the 324-row Qwen4.8
+        # shape) each streaming long coalesced K vectors hides HBM latency
+        # far better than fewer wider-n programs (11us vs 28us on SM100f).
+        BLOCK_N = 4
+        BLOCK_K = 1024
         _hc_down_silu_fma_kernel[(triton.cdiv(n_compute, BLOCK_N), M)](
             x,
             w,
@@ -303,8 +275,8 @@ def _hc_down_silu(
         )
         return
 
-    split_k, block_m, block_n = _SPLITK_TABLE[min(M, MAX_FUSED_M)]
-    block_k = 64
+    split_k = 6
+    block_m, block_n, block_k = 16, 64, 64
     grid = (triton.cdiv(M, block_m) * triton.cdiv(n_compute, block_n), split_k)
     partials = torch.empty(
         (split_k, M, n_compute), dtype=torch.float32, device=x.device
@@ -328,28 +300,17 @@ def _hc_down_silu(
         num_warps=4,
         num_stages=3,
     )
-    _hc_down_silu_epilogue_kernel[(triton.cdiv(M, block_m),)](
+    _hc_down_silu_epilogue_kernel[(M,)](
         partials,
         lora,
-        M,
-        RANK=rank,
-        HC=hc,
-        SPLIT_K=split_k,
-        BLOCK_M=block_m,
-        BLOCK_N=triton.next_power_of_2(n_compute),
-        launch_pdl=launch_pdl,
-        num_warps=4,
-    )
-    _hc_down_silu_inj_kernel[(M,)](
-        partials,
         injection,
         M,
         RANK=rank,
         HC=hc,
         SPLIT_K=split_k,
-        BLOCK_H=triton.next_power_of_2(hc),
+        BLOCK_N=triton.next_power_of_2(n_compute),
         launch_pdl=launch_pdl,
-        num_warps=1,
+        num_warps=4,
     )
 
 
