@@ -399,7 +399,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
