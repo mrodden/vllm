@@ -15,6 +15,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
@@ -117,9 +118,9 @@ def _ple_ngram_ids(
     layer_multipliers: torch.Tensor,
     ngram_heads_vocab_sizes: torch.Tensor,
     ngram_heads_offsets: torch.Tensor,
-    output: torch.Tensor,
     eos_token_id: int,
     heads_per_ngram: int,
+    output: torch.Tensor,
 ) -> None:
     input_ids = input_ids.reshape(-1)
     num_tokens = input_ids.shape[0]
@@ -147,6 +148,28 @@ def _ple_ngram_ids(
     )
 
 
+def _ple_ngram_ids_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    layer_multipliers: torch.Tensor,
+    ngram_heads_vocab_sizes: torch.Tensor,
+    ngram_heads_offsets: torch.Tensor,
+    eos_token_id: int,
+    heads_per_ngram: int,
+    output: torch.Tensor,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_amd_ple_ngram_ids",
+    op_func=_ple_ngram_ids,
+    mutates_args=["output"],
+    fake_impl=_ple_ngram_ids_fake,
+)
+
+
 def ple_ngram_ids(
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -156,24 +179,22 @@ def ple_ngram_ids(
     ngram_heads_offsets: torch.Tensor,
     eos_token_id: int,
     heads_per_ngram: int,
-    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if output is None:
-        output = torch.empty(
-            (input_ids.numel(), ngram_context.shape[1] * heads_per_ngram),
-            dtype=torch.int64,
-            device=input_ids.device,
-        )
-    _ple_ngram_ids(
+    output = torch.empty(
+        (input_ids.numel(), ngram_context.shape[1] * heads_per_ngram),
+        dtype=torch.int64,
+        device=input_ids.device,
+    )
+    torch.ops.vllm.qwen4_exp_amd_ple_ngram_ids(
         input_ids,
         query_start_loc,
         ngram_context,
         layer_multipliers,
         ngram_heads_vocab_sizes,
         ngram_heads_offsets,
-        output,
         eos_token_id,
         heads_per_ngram,
+        output,
     )
     return output
 
