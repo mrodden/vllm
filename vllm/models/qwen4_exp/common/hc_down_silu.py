@@ -178,7 +178,7 @@ def _hc_down_silu_dot_kernel(
     part_ptr += (
         (k_id * M + m_offs[:, None]) * (RANK + HC) + n_offs[None, :]
     )
-    tl.store(part_ptr, acc, mask=m_mask[:, None] & n_mask[:, None])
+    tl.store(part_ptr, acc, mask=m_mask[:, None] & n_mask[None, :])
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -187,7 +187,6 @@ def _hc_down_silu_dot_kernel(
 def _hc_down_silu_epilogue_kernel(
     part_ptr,
     lora_ptr,
-    inj_ptr,
     M,
     RANK: tl.constexpr,
     HC: tl.constexpr,
@@ -196,11 +195,12 @@ def _hc_down_silu_epilogue_kernel(
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
+    """Reduce split-K partials and write the SiLU'd lora columns."""
     pid = tl.program_id(0)
     m_offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     n_offs = tl.arange(0, BLOCK_N)
     m_mask = m_offs < M
-    n_mask = n_offs < RANK + HC
+    n_mask = n_offs < RANK
     N: tl.constexpr = RANK + HC
 
     if launch_pdl:
@@ -215,22 +215,56 @@ def _hc_down_silu_epilogue_kernel(
         )
         acc += p
 
+    # Production rounding boundary: bf16 GEMM output, fp32 SiLU.
     acc_bf16 = acc.to(tl.bfloat16).to(tl.float32)
-    is_lora = n_offs < RANK
     silu_in = acc_bf16 / HC
-    epilog = tl.where(is_lora, silu_in * tl.sigmoid(silu_in), acc_bf16)
-    epilog = epilog.to(tl.bfloat16)
+    epilog = (silu_in * tl.sigmoid(silu_in)).to(tl.bfloat16)
 
     tl.store(
         lora_ptr + m_offs[:, None] * RANK + n_offs[None, :],
         epilog,
-        mask=m_mask[:, None] & is_lora[None, :],
+        mask=m_mask[:, None] & n_mask[None, :],
     )
-    tl.store(
-        inj_ptr + m_offs[:, None] * HC + (n_offs - RANK)[None, :],
-        epilog,
-        mask=m_mask[:, None] & (~is_lora)[None, :],
-    )
+    if launch_pdl:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@triton.jit
+def _hc_down_silu_inj_kernel(
+    part_ptr,
+    inj_ptr,
+    M,
+    RANK: tl.constexpr,
+    HC: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    """Reduce split-K partials for the injection-logit columns (passthrough).
+
+    Kept as its own tiny kernel: a [BLOCK_M, BLOCK_N]-wide masked store into
+    a [M, HC] tensor with HC << BLOCK_N proved unreliable across triton
+    layouts (rows silently unwritten), while the row-program formulation is
+    trivially correct.
+    """
+    row = tl.program_id(0)
+    offs_hc = tl.arange(0, BLOCK_H)
+    mask_hc = offs_hc < HC
+    N: tl.constexpr = RANK + HC
+
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+
+    acc = tl.zeros([BLOCK_H], tl.float32)
+    for k in tl.static_range(SPLIT_K):
+        p = tl.load(
+            part_ptr + (k * M + row) * N + RANK + offs_hc,
+            mask=mask_hc,
+            other=0.0,
+        )
+        acc += p
+
+    tl.store(inj_ptr + row * HC + offs_hc, acc.to(tl.bfloat16), mask=mask_hc)
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -275,6 +309,8 @@ def _hc_down_silu(
     partials = torch.empty(
         (split_k, M, n_compute), dtype=torch.float32, device=x.device
     )
+    # Unmasked K loads require the whole split-K tiling to divide K evenly;
+    # otherwise the tail chunk of the last split would read past K.
     _hc_down_silu_dot_kernel[grid](
         x,
         w,
@@ -287,7 +323,7 @@ def _hc_down_silu(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
-        EVEN_K=(K % block_k == 0),
+        EVEN_K=(K % (split_k * block_k) == 0),
         launch_pdl=launch_pdl,
         num_warps=4,
         num_stages=3,
@@ -295,7 +331,6 @@ def _hc_down_silu(
     _hc_down_silu_epilogue_kernel[(triton.cdiv(M, block_m),)](
         partials,
         lora,
-        injection,
         M,
         RANK=rank,
         HC=hc,
@@ -304,6 +339,17 @@ def _hc_down_silu(
         BLOCK_N=triton.next_power_of_2(n_compute),
         launch_pdl=launch_pdl,
         num_warps=4,
+    )
+    _hc_down_silu_inj_kernel[(M,)](
+        partials,
+        injection,
+        M,
+        RANK=rank,
+        HC=hc,
+        SPLIT_K=split_k,
+        BLOCK_H=triton.next_power_of_2(hc),
+        launch_pdl=launch_pdl,
+        num_warps=1,
     )
 
 

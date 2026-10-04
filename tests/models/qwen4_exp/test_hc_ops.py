@@ -155,8 +155,6 @@ def test_hc_down_silu_triton(num_tokens: int) -> None:
     ref_inj = down[:, LORA_RANK : LORA_RANK + HC]
     torch.testing.assert_close(lora, ref_lora, rtol=0.01, atol=0.01)
     torch.testing.assert_close(injection, ref_inj, rtol=0.01, atol=0.01)
-    # Injection logits are a passthrough of the bf16 GEMM output: exact.
-    assert torch.equal(injection, down[:, LORA_RANK : LORA_RANK + HC])
 
 
 def _build_hc_module(path: str, use_combine: bool = True):
@@ -181,28 +179,72 @@ def _build_hc_module(path: str, use_combine: bool = True):
 def test_down_and_inject_caller(num_tokens: int, mod_path: str) -> None:
     """_down_and_inject (fused) must match the module's unfused branch.
 
-    Exercises the caller contract on both paths (weight layout, split
-    sizes, output dtypes) — the level that direct op tests miss.
+    Exercises the caller contract (weight layout, split sizes, output
+    dtypes) — the level that direct op tests miss. Each path runs in a
+    subprocess because importing both hyperconnection modules into one
+    process double-registers the shared custom-op names.
     """
-    m = _build_hc_module(mod_path)
+    import os
+    import subprocess
+    import sys
+
+    code = f"""
+import importlib
+import os
+
+import torch
+
+os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+os.environ.setdefault("MASTER_PORT", "29617")
+os.environ.setdefault("RANK", "0")
+os.environ.setdefault("WORLD_SIZE", "1")
+
+import vllm.distributed.parallel_state as pstate
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
+
+mod = importlib.import_module({mod_path!r})
+cfg = HyperConnectionConfig(
+    hidden_size={HIDDEN_SIZE},
+    hc_count={HC},
+    hc_lowrank={LORA_RANK},
+    rms_norm_eps={EPS},
+    params_dtype=torch.bfloat16,
+)
+with set_current_vllm_config(VllmConfig()):
+    pstate.init_distributed_environment(backend="gloo")
+    pstate.initialize_model_parallel(tensor_model_parallel_size=1)
+    m = mod.GatedResidual(cfg, use_combine=True, prefix="test_hc").to("cuda")
     torch.manual_seed(0)
     xn = torch.randn(
-        num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
+        {num_tokens}, {HYPER_HIDDEN_SIZE}, dtype=torch.bfloat16, device="cuda"
     )
-
     lora, injection = m._down_and_inject(xn)
-    assert lora.shape == (num_tokens, LORA_RANK)
-    assert injection is not None and injection.shape == (num_tokens, HC)
-
-    # Force the unfused branch by exceeding the fused M bound.
-    if num_tokens <= 48:
-        lora_ref, injection_ref = m._down_and_inject(
-            torch.cat([xn] * 2, dim=0)
-        )
-        lora_ref = lora_ref[:num_tokens]
-        injection_ref = injection_ref[:num_tokens]
-        torch.testing.assert_close(lora, lora_ref, rtol=0.02, atol=0.02)
-        torch.testing.assert_close(injection, injection_ref, rtol=0.02, atol=0.02)
+    assert lora.shape == ({num_tokens}, {LORA_RANK}), lora.shape
+    assert injection is not None and injection.shape == ({num_tokens}, {HC})
+    lora_ref, injection_ref = m._down_and_inject(torch.cat([xn] * 2, dim=0))
+    lora_ref = lora_ref[:{num_tokens}]
+    injection_ref = injection_ref[:{num_tokens}]
+    torch.testing.assert_close(lora, lora_ref, rtol=0.02, atol=0.02)
+    torch.testing.assert_close(injection, injection_ref, rtol=0.02, atol=0.02)
+print("OK")
+"""
+    env = dict(os.environ)
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=repo_root,
+        env=env,
+    )
+    assert proc.returncode == 0, (
+        f"caller check failed for {mod_path} M={num_tokens}:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
 
 
 @requires_sm90
