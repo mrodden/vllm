@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+
 import pytest
 import torch
 
@@ -134,6 +136,73 @@ def test_hc_combine_norm_unit_injection(num_tokens: int) -> None:
     expected_norm = grouped_gemma_rmsnorm(expected, weight, EPS, HC)
     assert torch.equal(actual, expected)
     torch.testing.assert_close(actual_norm, expected_norm)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 17, 48])
+def test_hc_down_silu_triton(num_tokens: int) -> None:
+    """Shared triton fused kernel must match the unfused eager reference."""
+    from vllm.models.qwen4_exp.common.hc_down_silu import hc_down_silu as triton_fused
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(DOWN_N, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+
+    lora, injection = triton_fused(x, weight, LORA_RANK, HC)
+
+    # Unfused reference: GEMM (fp32 acc -> bf16) -> split -> hc_silu.
+    down = (x.float() @ weight[: LORA_RANK + HC].float().t()).to(torch.bfloat16)
+    ref_lora = hc_silu(down[:, :LORA_RANK], HC)
+    ref_inj = down[:, LORA_RANK : LORA_RANK + HC]
+    torch.testing.assert_close(lora, ref_lora, rtol=0.01, atol=0.01)
+    torch.testing.assert_close(injection, ref_inj, rtol=0.01, atol=0.01)
+    # Injection logits are a passthrough of the bf16 GEMM output: exact.
+    assert torch.equal(injection, down[:, LORA_RANK : LORA_RANK + HC])
+
+
+def _build_hc_module(path: str, use_combine: bool = True):
+    """Instantiate a HyperConnection module from either path (CPU weights)."""
+    from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
+
+    mod = importlib.import_module(path)
+    cfg = HyperConnectionConfig(
+        hidden_size=HIDDEN_SIZE,
+        hc_count=HC,
+        hc_lowrank=LORA_RANK,
+        rms_norm_eps=EPS,
+        params_dtype=torch.bfloat16,
+    )
+    m = mod.GatedResidual(cfg, use_combine=use_combine, prefix="test_hc")
+    return m.to("cuda")
+
+
+@pytest.mark.parametrize("num_tokens", [1, 3, 17, 48])
+@pytest.mark.parametrize("mod_path", ["vllm.models.qwen4_exp.amd.hyperconnection",
+                                      "vllm.models.qwen4_exp.nvidia.hyperconnection"])
+def test_down_and_inject_caller(num_tokens: int, mod_path: str) -> None:
+    """_down_and_inject (fused) must match the module's unfused branch.
+
+    Exercises the caller contract on both paths (weight layout, split
+    sizes, output dtypes) — the level that direct op tests miss.
+    """
+    m = _build_hc_module(mod_path)
+    torch.manual_seed(0)
+    xn = torch.randn(
+        num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
+    )
+
+    lora, injection = m._down_and_inject(xn)
+    assert lora.shape == (num_tokens, LORA_RANK)
+    assert injection is not None and injection.shape == (num_tokens, HC)
+
+    # Force the unfused branch by exceeding the fused M bound.
+    if num_tokens <= 48:
+        lora_ref, injection_ref = m._down_and_inject(
+            torch.cat([xn] * 2, dim=0)
+        )
+        lora_ref = lora_ref[:num_tokens]
+        injection_ref = injection_ref[:num_tokens]
+        torch.testing.assert_close(lora, lora_ref, rtol=0.02, atol=0.02)
+        torch.testing.assert_close(injection, injection_ref, rtol=0.02, atol=0.02)
 
 
 @requires_sm90
