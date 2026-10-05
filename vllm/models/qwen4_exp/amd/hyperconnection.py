@@ -33,7 +33,11 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 
-from ..common.hc_down_silu import MAX_FUSED_M, hc_down_silu as _fused_hc_down_silu
+from ..common.hc_down_silu import (
+    MAX_FUSED_M,
+    hc_down_silu_backend,
+)
+from ..common.hc_down_silu import hc_down_silu as _triton_hc_down_silu
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
@@ -140,13 +144,26 @@ class GatedResidual(nn.Module):
         if not self.use_combine:
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
-        use_fused = (
+        backend = hc_down_silu_backend()
+        eligible = (
             self._use_hc_down_silu
+            and backend != "unfused"
             and not envs.VLLM_BATCH_INVARIANT
             and 1 <= xn.shape[0] <= MAX_FUSED_M
         )
-        if use_fused:
-            return _fused_hc_down_silu(
+        if eligible and backend == "cute_dsl":
+            from ..nvidia.ops.cute_dsl.hc_down_silu import (
+                hc_down_silu as cute_fused,
+            )
+
+            return cute_fused(
+                xn,
+                self.input_mix_weight_down_block_inject.weight,
+                self.lora_rank,
+                self.hc_count,
+            )
+        if eligible:
+            return _triton_hc_down_silu(
                 xn,
                 self.input_mix_weight_down_block_inject.weight,
                 self.lora_rank,

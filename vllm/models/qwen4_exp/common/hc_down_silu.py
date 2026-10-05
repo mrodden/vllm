@@ -60,6 +60,24 @@ def _hc_down_silu_fma_kernel(
     n_mask = n_offs < RANK + HC
     k_offs = tl.arange(0, BLOCK_K)
 
+    if launch_pdl and BLOCK_N == 4 and BLOCK_K == 1024:
+        # PDL weight prefetch: issue L2 prefetches for this program's
+        # ENTIRE weight tile before gdc_wait so they overlap the
+        # preceding kernel's tail (mirrors the cute_dsl
+        # prefetch_pdl_weights variant; the decode hot path is L2-cold
+        # in serving because all 96 HC weight matrices stream through
+        # between invocations).
+        for k0 in range(0, K, BLOCK_K):
+            w_tile_ptr = w_ptr + n_offs[:, None] * K + (k0 + k_offs)[None, :]
+            tl.inline_asm_elementwise(
+                asm="prefetch.global.L2 [$1]; mov.u32 $0, 0;",
+                constraints="=r,l",
+                args=[w_tile_ptr],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
 
@@ -359,7 +377,46 @@ def hc_down_silu(
     return lora, injection
 
 
+def cute_dsl_hc_down_silu_available() -> bool:
+    """Whether the NVIDIA cute_dsl fused kernel is usable on this platform.
+
+    The cute_dsl module only imports platform utilities at module level
+    (cutlass/quack are imported lazily at compile time), so probing is
+    cheap; the CUDA/SM90 gate and dependency check decide availability.
+    """
+    if not current_platform.is_cuda():
+        return False
+    if not current_platform.has_device_capability(90):
+        return False
+    try:
+        import cutlass  # noqa: F401
+        import quack  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def hc_down_silu_backend() -> str:
+    """Resolve the fused HC down+SiLU backend for the current platform.
+
+    Honors VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND={auto,cute_dsl,triton,unfused};
+    ``auto`` prefers the cute_dsl kernel where it is available (measured
+    faster in situ on CUDA: 6.2us vs ~11us for the triton kernel, thanks
+    to its PDL weight prefetch overlapping the preceding kernel) and
+    falls back to the portable triton kernel (ROCm, or CUDA without the
+    cute_dsl dependencies).
+    """
+    import vllm.envs as envs
+
+    backend = envs.VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND
+    if backend == "auto":
+        return "cute_dsl" if cute_dsl_hc_down_silu_available() else "triton"
+    return backend
+
+
 __all__ = [
     "MAX_FUSED_M",
+    "cute_dsl_hc_down_silu_available",
     "hc_down_silu",
+    "hc_down_silu_backend",
 ]

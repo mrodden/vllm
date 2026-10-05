@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 
+from ..common.hc_down_silu import hc_down_silu_backend
 from ..common.hc_down_silu import hc_down_silu as _shared_hc_down_silu
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
@@ -142,13 +143,14 @@ class GatedResidual(nn.Module):
         if not self.use_combine:
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
-        backend = envs.VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND
+        backend = hc_down_silu_backend()
         eligible = (
             self._use_hc_down_silu
+            and backend != "unfused"
             and not envs.VLLM_BATCH_INVARIANT
             and 1 <= xn.shape[0] <= MAX_FUSED_M
         )
-        use_fused = eligible and backend in ("auto", "cute_dsl")
+        use_fused = eligible and backend == "cute_dsl"
         use_triton = eligible and backend == "triton"
         if use_fused:
             return hc_down_silu(
