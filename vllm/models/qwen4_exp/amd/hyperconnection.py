@@ -117,6 +117,14 @@ class GatedResidual(nn.Module):
                 and weight.dtype == torch.bfloat16
                 and current_platform.has_device_capability(90)
             )
+            # Resolve once at construction: the resolver calls
+            # lru_cache-wrapped platform helpers that break Dynamo if
+            # invoked inside the traced forward region, and the env flag
+            # is fixed at startup.
+            self._hc_down_silu_backend = hc_down_silu_backend()
+            self._hc_down_silu_batch_invariant = bool(
+                envs.VLLM_BATCH_INVARIANT
+            )
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
@@ -144,11 +152,11 @@ class GatedResidual(nn.Module):
         if not self.use_combine:
             return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
 
-        backend = hc_down_silu_backend()
+        backend = self._hc_down_silu_backend
         eligible = (
             self._use_hc_down_silu
             and backend != "unfused"
-            and not envs.VLLM_BATCH_INVARIANT
+            and not self._hc_down_silu_batch_invariant
             and 1 <= xn.shape[0] <= MAX_FUSED_M
         )
         if eligible and backend == "cute_dsl":
