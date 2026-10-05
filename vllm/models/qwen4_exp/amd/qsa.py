@@ -397,13 +397,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if main_outputs is not None:
-            # Norm/RoPE/gate and the K/V cache write already ran fused.
+            # Norm/RoPE/gate and the K/V cache write already ran fused;
+            # key/value are unused by the sparse-attention kernel.
             query, gate = main_outputs
             if gate_out is not None:
                 gate_out.copy_(gate)
-            key = value = None
-        if query is None or key is None or value is None:
-            raise RuntimeError("QSA owner did not produce Q/K/V")
+        if query is None:
+            raise RuntimeError("QSA owner did not produce Q and gate")
         impl.forward_qsa(
             self,
             query,
@@ -459,6 +459,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:
+            gate = gate.view(num_tokens, -1)
             flat_output = flat_output * torch.sigmoid(gate)
         output, _ = self.o_proj(flat_output)
         return output
