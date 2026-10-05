@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -23,6 +23,9 @@ from ..common.qsa_cache import (
     QSAKeyStateCache,
     canonical_qsa_rope_positions,
 )
+
+if TYPE_CHECKING:
+    from .qsa import Qwen4ExpQSAAttention
 
 
 def apply_qsa_rope(
@@ -276,13 +279,24 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        *,
+        attn: Qwen4ExpQSAAttention | None = None,
+        qkv: torch.Tensor | None = None,
+        slot_mapping: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Return fixed-width request-relative token indices padded with ``-1``.
+
+        With ``attn.use_fused_qsa_prepare``, the same launch that updates the
+        side caches also writes ``attn``'s K/V into ``attn.kv_cache`` at
+        ``slot_mapping`` and prepares its Q and gate from ``qkv``, returned as
+        the second element (None otherwise). ``qkv`` and ``slot_mapping`` are
+        only read in that mode.
+        """
         metadata = self._metadata()
         if metadata is None:
             # Preserve step-0 indices when later MTP steps reuse the buffer.
             if self.skip_topk and out is not None:
-                return out
+                return out, None
             result = torch.full(
                 (hidden_states.shape[0], self.output_width),
                 -1,
@@ -291,10 +305,77 @@ class QSAIndexer(nn.Module):
             )
             if out is not None:
                 out.copy_(result)
-                return out
-            return result
+                return out, None
+            return result, None
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
+        main_outputs: tuple[torch.Tensor, torch.Tensor] | None = None
+        if (
+            attn is not None
+            and getattr(attn, "use_fused_qsa_prepare", False)
+            and qkv is not None
+            and slot_mapping is not None
+        ):
+            projected_qk, _ = self.index_qk_proj(hidden_states[:num_tokens])
+            projected_q, raw_keys = projected_qk.split(
+                (
+                    self.index_n_heads * self.index_head_dim,
+                    self.index_kv_heads * self.index_head_dim,
+                ),
+                dim=-1,
+            )
+            q = projected_q.new_empty(
+                num_tokens,
+                self.index_n_heads,
+                self.index_head_dim,
+                dtype=torch.bfloat16,
+            )
+            main_kv_cache = attn.kv_cache.transpose(1, 2)
+            from ..nvidia.ops.qsa_prepare import qsa_prepare
+
+            main_outputs = qsa_prepare(
+                projected_q,
+                raw_keys,
+                positions[..., :num_tokens],
+                self.rotary_emb.cos_sin_cache,
+                self.q_layernorm.weight,
+                self.k_layernorm.weight,
+                self.q_layernorm.variance_epsilon,
+                q,
+                self.raw_key_cache.kv_cache,
+                raw_metadata.slot_mapping,
+                raw_metadata.block_table,
+                raw_metadata.query_start_loc,
+                raw_metadata.logical_positions,
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                compressed_metadata.k_work_metadata,
+                compress_ratio=self.compress_ratio,
+                mrope_section=getattr(self.rotary_emb, "mrope_section", None),
+                rope_pos_offset=(
+                    self.raw_key_cache.rope_position_offset
+                    if self.raw_key_cache.rope_position_cache is not None
+                    else None
+                ),
+                main_qkv=qkv[:num_tokens],
+                main_q_norm_weight=attn.q_norm.weight,
+                main_k_norm_weight=attn.k_norm.weight,
+                main_eps=attn.q_norm.variance_epsilon,
+                main_kv_cache=main_kv_cache,
+                main_slot_mapping=slot_mapping[:num_tokens],
+                main_k_scale=1.0,
+                main_v_scale=1.0,
+            )
+            selected = out if out is not None else torch.empty(
+                num_tokens,
+                self.output_width,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            if self.skip_topk:
+                return selected, main_outputs
+            return self._select(q, compressed_metadata, selected), main_outputs
+
         q, token_k = self.project_qk(
             hidden_states[:num_tokens], positions[..., :num_tokens]
         )
@@ -307,8 +388,9 @@ class QSAIndexer(nn.Module):
         if self.skip_topk:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
-            return out
-        return self._select(q, compressed_metadata, out)
+            return out, None
+        sel = self._select(q, compressed_metadata, out)
+        return sel, None
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rope"]

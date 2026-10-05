@@ -307,6 +307,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
         )
+        # One launch does the indexer prepare, the main QK-norm/RoPE/gate and
+        # the main K/V cache write (see QSAIndexer.forward); otherwise all of
+        # them take separate kernels. Mirrors the NVIDIA path's
+        # _supports_fused_pre_indexer shape checks.
+        self.use_fused_qsa_prepare = (
+            self.use_fused_qk_norm_rope_gate
+            and self.indexer.index_head_dim == 128
+            and int(self.rotary_emb.rotary_dim) == 64
+            and self.indexer.index_kv_heads == 1
+            and self.indexer.compress_ratio > 1
+            and self.indexer.compress_ratio & (self.indexer.compress_ratio - 1) == 0
+        )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.register_buffer(
             "topk_indices_buffer",
@@ -340,17 +352,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        query: torch.Tensor | None,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
         output: torch.Tensor,
+        qkv: torch.Tensor | None = None,
+        gate_out: torch.Tensor | None = None,
     ) -> None:
+        """Run the complete QSA state/update/attend transaction.
+
+        ``gate_out`` receives the pre-sigmoid attention output gate when the
+        fused prepare runs (None leaves the caller's eager gate in place)."""
+        # query/key/value are None when the fused prepare runs inside the
+        # indexer launch.
         metadata = get_forward_context().attn_metadata
         if isinstance(metadata, list):
             metadata = metadata[0]
         if not isinstance(metadata, dict):
             output.zero_()
-            return
+            return None
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
         if self.kv_cache.numel() == 0:
             raise RuntimeError("QSA main K/V cache is not bound")
@@ -362,10 +382,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
-        selected = self.indexer(
+        selected, main_outputs = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
+            attn=self,
+            qkv=qkv,
+            slot_mapping=main_metadata.slot_mapping,
         )
         if selected.shape != (
             num_tokens,
@@ -373,13 +396,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
+        if main_outputs is not None:
+            # Norm/RoPE/gate and the K/V cache write already ran fused.
+            query, gate = main_outputs
+            if gate_out is not None:
+                gate_out.copy_(gate)
+            key = value = None
+        if query is None or key is None or value is None:
+            raise RuntimeError("QSA owner did not produce Q/K/V")
         impl.forward_qsa(
             self,
             query,
@@ -397,12 +421,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
-        query = q.view(num_tokens, self.num_heads, self.head_dim)
-        key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        attn_output = torch.empty_like(query)
+        if not self.use_fused_qsa_prepare:
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            query = q.view(num_tokens, self.num_heads, self.head_dim)
+            key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+            value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+        else:
+            # Norm/RoPE/gate and the K/V cache write happen inside _run_qsa.
+            query = key = value = None
+            gate = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
+        attn_output = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
@@ -413,6 +442,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value,
                 attn_output,
                 encoded_layer_name,
+                qkv,
+                gate,
             )
         else:
             qwen4_exp_qsa_with_output(
@@ -423,6 +454,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value,
                 attn_output,
                 encoded_layer_name,
+                qkv,
+                gate,
             )
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:
@@ -439,6 +472,8 @@ def qwen4_exp_qsa_with_output(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: LayerNameType,
+    qkv: torch.Tensor | None = None,
+    gate_out: torch.Tensor | None = None,
 ) -> None:
     """Run the complete QSA state/update/attend transaction."""
     layer_name = _resolve_layer_name(layer_name)
@@ -452,13 +487,15 @@ def qwen4_exp_qsa_with_output(
         key,
         value,
         output,
+        qkv,
+        gate_out,
     )
 
 
 direct_register_custom_op(
     op_name="qwen4_exp_qsa_with_output",
     op_func=qwen4_exp_qsa_with_output,
-    mutates_args=["output"],
+    mutates_args=["output", "gate_out"],
 )
 
 
