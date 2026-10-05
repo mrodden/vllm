@@ -401,7 +401,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             # key/value are unused by the sparse-attention kernel.
             query, gate = main_outputs
             if gate_out is not None:
-                gate_out.copy_(gate)
+                # Under piecewise graphs gate_out is allocated for the padded
+                # batch while the fused prepare only covers actual tokens;
+                # zero the tail so the caller's sigmoid multiply stays finite
+                # on discarded rows.
+                n = min(gate_out.shape[0], gate.shape[0])
+                gate_out[n:].zero_()
+                gate_out[:n].copy_(gate)
         if query is None:
             raise RuntimeError("QSA owner did not produce Q and gate")
         impl.forward_qsa(
