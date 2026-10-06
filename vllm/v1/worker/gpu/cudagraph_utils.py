@@ -557,7 +557,27 @@ class CudaGraphManager:
         # cannot see. Without this, replay could overwrite static buffers
         # while those copies are still in flight.
         get_offloader().sync_prev_onload()
+        import time as _time
+
+        import vllm.envs as _envs
+
+        _t0 = _time.perf_counter() if _envs.VLLM_STEP_PHASE_TIMING else None
         self.graphs[desc].replay()
+        if _t0 is not None:
+            _wpt = getattr(self, "_replay_host_samples", None)
+            if _wpt is None:
+                _wpt = self._replay_host_samples = []
+            _wpt.append((_time.perf_counter() - _t0) * 1e6)
+            if len(_wpt) >= 1024:
+                _wpt.sort()
+                from vllm.logger import init_logger as _il
+
+                _il(__name__).info(
+                    "replay-host-timing: p50=%.0fus p90=%.0fus",
+                    _wpt[len(_wpt) // 2],
+                    _wpt[int(len(_wpt) * 0.9)],
+                )
+                self._replay_host_samples = []
 
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
