@@ -195,6 +195,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    output_gate_ptr,
     stride_q_row,
     stride_q_head,
     stride_k_block,
@@ -207,6 +208,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_table_req,
     stride_output_row,
     stride_output_head,
+    stride_output_gate_row,
+    stride_output_gate_head,
     num_rows,
     num_cache_blocks,
     num_requests,
@@ -218,6 +221,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     NUM_TILES: tl.constexpr,
+    HAS_OUTPUT_GATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ) -> None:
@@ -317,6 +321,21 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     )
     output_mask = head_offsets[:, None] < GROUP_SIZE
     if NUM_SPLITS == 1:
+        if HAS_OUTPUT_GATE:
+            # Preserve the unfused path's BF16 attention-output rounding
+            # before applying the gate in FP32.
+            normalized_output = normalized_output.to(output_ptr.dtype.element_ty)
+            output_gate = tl.load(
+                output_gate_ptr
+                + row * stride_output_gate_row
+                + (first_head + head_offsets[:, None]) * stride_output_gate_head
+                + dim_offsets[None, :],
+                mask=output_mask,
+                other=0.0,
+            ).to(tl.float32)
+            normalized_output = normalized_output.to(tl.float32) * tl.sigmoid(
+                output_gate
+            )
         tl.store(
             output_ptr
             + row * stride_output_row
@@ -358,12 +377,16 @@ def _qsa_merge_splitk_kernel(
     partial_output_ptr,
     partial_lse_ptr,
     output_ptr,
+    output_gate_ptr,
     stride_output_row,
     stride_output_head,
+    stride_output_gate_row,
+    stride_output_gate_head,
     num_rows,
     HEAD_DIM: tl.constexpr,
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    HAS_OUTPUT_GATE: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
@@ -391,6 +414,17 @@ def _qsa_merge_splitk_kernel(
     )
     merged = tl.sum(partial_output * weights[:, None], axis=0)
     merged = tl.where(denominator > 0, merged / denominator, 0.0)
+    if HAS_OUTPUT_GATE:
+        # Preserve the unfused path's BF16 attention-output rounding
+        # before applying the gate in FP32.
+        merged = merged.to(output_ptr.dtype.element_ty)
+        output_gate = tl.load(
+            output_gate_ptr
+            + row * stride_output_gate_row
+            + head * stride_output_gate_head
+            + dim_offsets
+        ).to(tl.float32)
+        merged = merged.to(tl.float32) * tl.sigmoid(output_gate)
     tl.store(
         output_ptr + row * stride_output_row + head * stride_output_head + dim_offsets,
         merged,
@@ -824,6 +858,7 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 K/V caches."""
     if not q.is_cuda or not HAS_TRITON:
@@ -857,6 +892,11 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse output must match its query")
     assert out.dtype == q.dtype and out.device == q.device
     assert out.stride(2) == 1
+    if output_gate is not None:
+        if output_gate.shape != q.shape:
+            raise ValueError("QSA output gate must match its query")
+        assert output_gate.dtype == q.dtype and output_gate.device == q.device
+        assert output_gate.stride(2) == 1
     if not q.shape[0]:
         return out
 
@@ -902,6 +942,9 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
+    gate_view = output_gate.view_as(q) if output_gate is not None else out
+    gate_stride_row = gate_view.stride(0) if output_gate is not None else 0
+    gate_stride_head = gate_view.stride(1) if output_gate is not None else 0
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
         q,
@@ -913,6 +956,7 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        gate_view,
         q.stride(0),
         q.stride(1),
         k_cache.stride(0),
@@ -925,6 +969,8 @@ def qsa_sparse_paged_attention(
         block_table.stride(0),
         out.stride(0),
         out.stride(1),
+        gate_stride_row,
+        gate_stride_head,
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
@@ -936,6 +982,7 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         NUM_TILES=num_tiles,
+        HAS_OUTPUT_GATE=output_gate is not None,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
@@ -948,12 +995,16 @@ def qsa_sparse_paged_attention(
         partial_output,
         partial_lse,
         out,
+        gate_view,
         out.stride(0),
         out.stride(1),
+        gate_stride_row,
+        gate_stride_head,
         q.shape[0],
         HEAD_DIM=q.shape[2],
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
+        HAS_OUTPUT_GATE=output_gate is not None,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
         num_warps=2,
         num_stages=1,

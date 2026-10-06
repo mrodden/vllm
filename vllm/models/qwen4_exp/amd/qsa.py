@@ -122,6 +122,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        output_gate: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -151,6 +152,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         from .ops.qsa import qsa_sparse_paged_attention
 
+        # When the fused prepare produced the gate, the sigmoid multiply runs
+        # inside the attention kernel (mirrors the NVIDIA path), saving three
+        # eager elementwise launches per QSA layer per step.
+        gate_slice = None
+        if output_gate is not None:
+            gate_slice = output_gate[:num_tokens]
         qsa_sparse_paged_attention(
             query[:num_tokens],
             key_cache,
@@ -159,6 +166,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            output_gate=gate_slice,
         )
         return output
 
@@ -361,8 +369,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     ) -> None:
         """Run the complete QSA state/update/attend transaction.
 
-        ``gate_out`` receives the pre-sigmoid attention output gate when the
-        fused prepare runs (None leaves the caller's eager gate in place)."""
+        ``gate_out`` is the caller's padded gate buffer, kept for the op
+        schema; in the fused path the attention kernel consumes the prepare's
+        gate directly and this buffer is unused."""
         # query/key/value are None when the fused prepare runs inside the
         # indexer launch.
         metadata = get_forward_context().attn_metadata
@@ -396,18 +405,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+        fused_gate: torch.Tensor | None = None
         if main_outputs is not None:
             # Norm/RoPE/gate and the K/V cache write already ran fused;
-            # key/value are unused by the sparse-attention kernel.
-            query, gate = main_outputs
-            if gate_out is not None:
-                # Under piecewise graphs gate_out is allocated for the padded
-                # batch while the fused prepare only covers actual tokens;
-                # zero the tail so the caller's sigmoid multiply stays finite
-                # on discarded rows.
-                n = min(gate_out.shape[0], gate.shape[0])
-                gate_out[n:].zero_()
-                gate_out[:n].copy_(gate)
+            # key/value are unused by the sparse-attention kernel. Pass the
+            # prepare's gate directly to the attention kernel (it covers
+            # exactly num_actual_tokens rows), skipping the padded
+            # caller-side gate_out buffer entirely.
+            query, fused_gate = main_outputs
         if query is None:
             raise RuntimeError("QSA owner did not produce Q and gate")
         impl.forward_qsa(
@@ -419,6 +424,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            output_gate=fused_gate,
         )
 
     def forward(
@@ -428,15 +434,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         num_tokens = hidden_states.shape[0]
+        gate_out = None
         if not self.use_fused_qsa_prepare:
             q, k, v, gate = self._project_qkv_gate(qkv, positions)
             query = q.view(num_tokens, self.num_heads, self.head_dim)
             key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
             value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
         else:
-            # Norm/RoPE/gate and the K/V cache write happen inside _run_qsa.
-            query = key = value = None
-            gate = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
+            # Norm/RoPE/gate and the K/V cache write happen inside _run_qsa;
+            # the gate sigmoid runs inside the attention kernel, so this
+            # forward applies no eager gate multiply.
+            query = key = value = gate = None
+            gate_out = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
         attn_output = qkv.new_empty(num_tokens, self.num_heads, self.head_dim)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
@@ -449,7 +458,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 attn_output,
                 encoded_layer_name,
                 qkv,
-                gate,
+                gate_out,
             )
         else:
             qwen4_exp_qsa_with_output(
@@ -461,7 +470,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 attn_output,
                 encoded_layer_name,
                 qkv,
-                gate,
+                gate_out,
             )
         flat_output = attn_output.view(num_tokens, -1)
         if gate is not None:

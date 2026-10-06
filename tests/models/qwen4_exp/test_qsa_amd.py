@@ -295,3 +295,53 @@ def test_qsa_sparse_paged_attention_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_qsa_sparse_paged_attention_gated_matches_reference() -> None:
+    """The in-kernel output gate must equal the eager sigmoid multiply.
+
+    Mirrors the numerical contract of the NVIDIA kernel: the attention
+    output is rounded to BF16 first, then gated in FP32.
+    """
+    torch.manual_seed(3)
+    num_rows, num_requests = 5, 2
+    context_length = 96
+    num_kv_heads = 1
+    group_size = 4
+    head_dim = 64
+    page_size = 16
+    num_pages = 16
+    k_cache = torch.randn(
+        num_pages, page_size, num_kv_heads, head_dim,
+        dtype=torch.bfloat16, device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(
+        num_rows, num_kv_heads * group_size, head_dim,
+        dtype=torch.bfloat16, device="cuda",
+    )
+    gate = torch.randn_like(q)
+    token_to_req = torch.arange(num_rows, device="cuda", dtype=torch.int32) % 2
+    block_table = torch.arange(
+        num_requests * 4, device="cuda", dtype=torch.int32
+    ).reshape(num_requests, 4)
+    logical_indices = torch.randint(
+        0, context_length, (num_rows, 32), device="cuda", dtype=torch.int32
+    )
+    logical_indices[:, -3:] = -1
+
+    ungated = qsa_ops.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req
+    )
+    gated = qsa_ops.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        output_gate=gate,
+    )
+    # The kernel's contract: bf16 round, then fp32 sigmoid gate.
+    expected = (ungated.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
+    torch.testing.assert_close(gated, expected, rtol=2e-2, atol=2e-2)
