@@ -767,7 +767,7 @@ class EngineCore:
             and not hasattr(self, "_step_phase_timer")
         ):
             self._step_phase_timer = _StepPhaseTimer()
-        _t0 = _time.perf_counter()
+        _t0 = _t1 = _t2 = _time.perf_counter()
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
