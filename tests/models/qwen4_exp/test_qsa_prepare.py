@@ -416,6 +416,7 @@ def test_qsa_fused_prepare_matches_unfused(
         pytest.param(False, False, False, id="text"),
     ],
 )
+@pytest.mark.usefixtures("default_vllm_config")
 def test_qsa_fused_prepare_compress_ratio_sweep(
     compress_ratio: int,
     mrope: bool,
@@ -456,6 +457,7 @@ def test_qsa_fused_prepare_eligibility_gate(
     kernel. Exercises _supports_fused_qsa_prepare, the same predicate
     Qwen4ExpQSAAttention.__init__ consults.
     """
+    import vllm.models.qwen4_exp.amd.model  # noqa: F401  (import order)
     from vllm.models.qwen4_exp.amd.qsa import _supports_fused_qsa_prepare
 
     assert (
