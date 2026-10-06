@@ -758,14 +758,26 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        import time as _time
+
+        import vllm.envs as _envs
+
+        if (
+            _envs.VLLM_STEP_PHASE_TIMING
+            and not hasattr(self, "_step_phase_timer")
+        ):
+            self._step_phase_timer = _StepPhaseTimer()
+        _t0 = _time.perf_counter()
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            _t1 = _time.perf_counter()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            _t2 = _time.perf_counter()
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -805,6 +817,7 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        _t3 = _time.perf_counter()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -815,6 +828,7 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        _t4 = _time.perf_counter()
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -823,6 +837,14 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        _t5 = _time.perf_counter()
+        if getattr(self, "_step_phase_timer", None) is not None:
+            tm = self._step_phase_timer
+            tm.observe("schedule", _t1 - _t0)
+            tm.observe("exec_submit", _t2 - _t1)
+            tm.observe("exec_wait", _t4 - _t3)
+            tm.observe("update_output", _t5 - _t4)
+            tm.observe("step_total", _t5 - _t0)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
