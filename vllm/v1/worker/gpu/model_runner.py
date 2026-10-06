@@ -294,6 +294,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
 
         self.step_timing = StepTimingCollector()
+        self._worker_phase_timing = bool(envs.VLLM_STEP_PHASE_TIMING)
+        self._worker_phase_samples: dict[str, list[float]] = {}
+        self._worker_phase_count = 0
 
         # General request states.
         self.req_states = RequestState(
@@ -1696,6 +1699,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _wpt_observe(self, phase: str, seconds: float) -> None:
+        if not self._worker_phase_timing:
+            return
+        self._worker_phase_samples.setdefault(phase, []).append(seconds * 1e6)
+        if phase == "step_total":
+            self._worker_phase_count += 1
+            if self._worker_phase_count % 256 == 0:
+                parts = []
+                for name, vals in self._worker_phase_samples.items():
+                    vals.sort()
+                    parts.append(f"{name}={vals[len(vals) // 2]:.0f}us")
+                logger.info("worker-phase-timing: %s", " ".join(parts))
+                self._worker_phase_samples = {}
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1707,6 +1724,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        import time as _time
+
+        _w0 = _time.perf_counter()
+        _w1 = _w2 = _w3 = _w4 = _w0
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1789,10 +1810,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
+            _w1 = _time.perf_counter()
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            _w2 = _time.perf_counter()
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1890,6 +1913,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
+            _w3 = _time.perf_counter()
             attn_metadata = self.model_state.prepare_attn(
                 input_batch,
                 batch_desc.cg_mode,
@@ -1963,6 +1987,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Update the EPLB meta.
         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+        _w4 = _time.perf_counter()
         self.eplb.prepare_forward(
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
@@ -2030,6 +2055,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        _w5 = _time.perf_counter()
+        self._wpt_observe("req_state", _w1 - _w0)
+        self._wpt_observe("inputs", _w2 - _w1)
+        self._wpt_observe("attn_meta", _w4 - _w3)
+        self._wpt_observe("forward_cpu", _w5 - _w4)
+        self._wpt_observe("step_total", _w5 - _w0)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
