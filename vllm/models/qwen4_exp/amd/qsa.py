@@ -56,6 +56,28 @@ from . import model
 from .indexer_qsa import QSAIndexer
 
 
+def _supports_fused_qsa_prepare(
+    use_fused_qk_norm_rope_gate: bool,
+    index_head_dim: int,
+    rotary_dim: int,
+    index_kv_heads: int,
+    compress_ratio: int,
+) -> bool:
+    """Eligibility for the single-launch fused QSA prepare.
+
+    The fused triton kernel supports head_dim 128 with rotary_dim 64,
+    one indexer K/V head, and power-of-2 compress ratios only.
+    """
+    return (
+        use_fused_qk_norm_rope_gate
+        and index_head_dim == 128
+        and rotary_dim == 64
+        and index_kv_heads == 1
+        and compress_ratio > 1
+        and compress_ratio & (compress_ratio - 1) == 0
+    )
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -319,13 +341,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # the main K/V cache write (see QSAIndexer.forward); otherwise all of
         # them take separate kernels. Mirrors the NVIDIA path's
         # _supports_fused_pre_indexer shape checks.
-        self.use_fused_qsa_prepare = (
-            self.use_fused_qk_norm_rope_gate
-            and self.indexer.index_head_dim == 128
-            and int(self.rotary_emb.rotary_dim) == 64
-            and self.indexer.index_kv_heads == 1
-            and self.indexer.compress_ratio > 1
-            and self.indexer.compress_ratio & (self.indexer.compress_ratio - 1) == 0
+        self.use_fused_qsa_prepare = _supports_fused_qsa_prepare(
+            self.use_fused_qk_norm_rope_gate,
+            self.indexer.index_head_dim,
+            int(self.rotary_emb.rotary_dim),
+            self.indexer.index_kv_heads,
+            self.indexer.compress_ratio,
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.register_buffer(

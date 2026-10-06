@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness tests for the fused QSA prepare kernel."""
 
+
 import pytest
 import torch
 
@@ -172,11 +173,14 @@ def test_qsa_fused_prepare_matches_unfused(
     seq_lens,
     query_lens,
     history_lens,
+    compress_ratio=CR,
 ) -> None:
     from flashinfer.norm import gemma_rmsnorm
 
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
+    CR = compress_ratio
+    COMP_PAGE = BLOCK_SIZE // CR
     device = "cuda"
     rope_params = {
         "partial_rotary_factor": 0.25,
@@ -401,3 +405,66 @@ def test_qsa_fused_prepare_matches_unfused(
         torch.testing.assert_close(
             fused_compressed, unfused_compressed, rtol=RTOL, atol=ATOL
         )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("compress_ratio", [2, 8, 16])
+@pytest.mark.parametrize(
+    "mrope,is_2d_positions,cache_rope_positions",
+    [
+        pytest.param(True, True, True, id="mrope"),
+        pytest.param(False, False, False, id="text"),
+    ],
+)
+def test_qsa_fused_prepare_compress_ratio_sweep(
+    compress_ratio: int,
+    mrope: bool,
+    is_2d_positions: bool,
+    cache_rope_positions: bool,
+) -> None:
+    """Power-of-2 compress ratios beyond the production value (4)."""
+    test_qsa_fused_prepare_matches_unfused(
+        indexer_dtype=torch.bfloat16,
+        mrope=mrope,
+        is_2d_positions=is_2d_positions,
+        cache_rope_positions=cache_rope_positions,
+        state_size=4,
+        seq_lens=MIXED_BATCH[0],
+        query_lens=MIXED_BATCH[1],
+        history_lens=MIXED_BATCH[2],
+        compress_ratio=compress_ratio,
+    )
+
+
+@pytest.mark.parametrize(
+    ("compress_ratio", "eligible"),
+    [
+        pytest.param(2, True, id="cr2"),
+        pytest.param(3, False, id="cr3_nonpow2"),
+        pytest.param(4, True, id="cr4_production"),
+        pytest.param(5, False, id="cr5_nonpow2"),
+        pytest.param(1, False, id="cr1_no_compression"),
+    ],
+)
+def test_qsa_fused_prepare_eligibility_gate(
+    compress_ratio: int, eligible: bool
+) -> None:
+    """The fused-prepare eligibility predicate must reject unsupported shapes.
+
+    Non-power-of-2 (or trivial) compress ratios disable the fused path so
+    the caller runs the unfused projection instead of a miscompiled
+    kernel. Exercises _supports_fused_qsa_prepare, the same predicate
+    Qwen4ExpQSAAttention.__init__ consults.
+    """
+    from vllm.models.qwen4_exp.amd.qsa import _supports_fused_qsa_prepare
+
+    assert (
+        _supports_fused_qsa_prepare(
+            use_fused_qk_norm_rope_gate=True,
+            index_head_dim=128,
+            rotary_dim=64,
+            index_kv_heads=1,
+            compress_ratio=compress_ratio,
+        )
+        is eligible
+    )

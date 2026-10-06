@@ -138,9 +138,13 @@ def test_hc_combine_norm_unit_injection(num_tokens: int) -> None:
     torch.testing.assert_close(actual_norm, expected_norm)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 17, 48])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 5, 17, 48, 49, 64, 128])
 def test_hc_down_silu_triton(num_tokens: int) -> None:
-    """Shared triton fused kernel must match the unfused eager reference."""
+    """Shared triton fused kernel must match the unfused eager reference.
+
+    48/49 straddle MAX_FUSED_M: at/under it the fused kernel runs; above
+    it the caller falls back, and both paths must match the reference.
+    """
     from vllm.models.qwen4_exp.common.hc_down_silu import hc_down_silu as triton_fused
 
     torch.manual_seed(0)
@@ -155,6 +159,35 @@ def test_hc_down_silu_triton(num_tokens: int) -> None:
     ref_inj = down[:, LORA_RANK : LORA_RANK + HC]
     torch.testing.assert_close(lora, ref_lora, rtol=0.01, atol=0.01)
     torch.testing.assert_close(injection, ref_inj, rtol=0.01, atol=0.01)
+
+
+@pytest.mark.parametrize("lora_rank", [64, 320, 512])
+@pytest.mark.parametrize("hc_count", [1, 4, 8])
+def test_hc_down_silu_triton_shape_sweep(lora_rank: int, hc_count: int) -> None:
+    """Vary rank/hc_count and the merged weight's row count.
+
+    DOWN_N stays a multiple of 8 at the pad boundary; also exercise the
+    un-padded rank+hc row count (the kernel must mask it correctly).
+    """
+    from vllm.models.qwen4_exp.common.hc_down_silu import hc_down_silu as triton_fused
+
+    for num_tokens in (1, 17, 48):
+        for down_n in (lora_rank + hc_count, lora_rank + hc_count + 12):
+            torch.manual_seed(lora_rank * 100 + hc_count + num_tokens + down_n)
+            x = torch.randn(
+                num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
+            )
+            weight = torch.randn(
+                down_n, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
+            )
+            lora, injection = triton_fused(x, weight, lora_rank, hc_count)
+            down = (
+                x.float() @ weight[: lora_rank + hc_count].float().t()
+            ).to(torch.bfloat16)
+            ref_lora = hc_silu(down[:, :lora_rank], hc_count)
+            ref_inj = down[:, lora_rank : lora_rank + hc_count]
+            torch.testing.assert_close(lora, ref_lora, rtol=0.01, atol=0.01)
+            torch.testing.assert_close(injection, ref_inj, rtol=0.01, atol=0.01)
 
 
 def _build_hc_module(path: str, use_combine: bool = True):
@@ -173,7 +206,7 @@ def _build_hc_module(path: str, use_combine: bool = True):
     return m.to("cuda")
 
 
-@pytest.mark.parametrize("num_tokens", [1, 3, 17, 48])
+@pytest.mark.parametrize("num_tokens", [1, 3, 17, 47, 48, 49])
 @pytest.mark.parametrize("mod_path", ["vllm.models.qwen4_exp.amd.hyperconnection",
                                       "vllm.models.qwen4_exp.nvidia.hyperconnection"])
 def test_down_and_inject_caller(num_tokens: int, mod_path: str) -> None:

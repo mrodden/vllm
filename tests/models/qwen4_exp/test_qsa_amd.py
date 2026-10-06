@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,8 +21,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_rocm(),
-    reason="AMD QSA requires ROCm",
+    not current_platform.is_cuda_alike(),
+    reason="AMD QSA tests run on CUDA and ROCm",
 )
 
 requires_qsa_kernels = pytest.mark.skipif(
@@ -67,9 +66,12 @@ def _qsa_sparse_paged_attention_reference(
     output = torch.zeros_like(q)
     repeats = q.shape[1] // k_cache.shape[2]
     page_size = k_cache.shape[1]
+    # Mirror the kernel's page-table-width guard: indices resolving to a
+    # logical page beyond the block table are dropped, not clamped.
+    max_logical = block_table.shape[1] * page_size
     for row in range(q.shape[0]):
         logical = logical_indices[row]
-        logical = logical[logical >= 0].long()
+        logical = logical[(logical >= 0) & (logical < max_logical)].long()
         if not logical.numel():
             continue
         request = token_to_req[row].long()
@@ -197,151 +199,227 @@ def test_qsa_selection_uses_portable_topk_on_rocm(
 
 
 @requires_qsa_kernels
-@pytest.mark.parametrize(
-    ("num_rows", "num_query_heads", "num_kv_heads", "page_size"),
-    [
-        pytest.param(1, 24, 2, 1792, id="tp1_split64"),
-        pytest.param(16, 12, 1, 1792, id="tp2_split32"),
-        pytest.param(32, 6, 1, 1024, id="tp4_split8"),
-        pytest.param(257, 6, 1, 1024, id="tp4_split4"),
-        pytest.param(513, 6, 1, 1024, id="tp4_split1"),
-    ],
-)
-def test_qsa_sparse_paged_attention_matches_reference(
+def _run_sparse_paged_case(
     num_rows: int,
     num_query_heads: int,
     num_kv_heads: int,
+    head_dim: int,
     page_size: int,
+    selection_width: int,
+    num_requests: int = 2,
+    invalid_tail: int = 0,
+    out_of_range: bool = False,
 ) -> None:
-    torch.manual_seed(2)
-    head_dim = 256
-    num_requests = 2
-    num_selected_pages = 64
-    num_pages_per_request = num_selected_pages + 1
-    num_cache_blocks = num_requests * num_pages_per_request
-    indexer_budget = 2048
-    indexer_compress_ratio = 4
-    selection_width = indexer_budget + indexer_compress_ratio - 1
-    q = torch.randn(
-        num_rows, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
-    kv_cache = torch.randn(
-        num_cache_blocks,
-        page_size,
-        num_kv_heads,
-        2 * head_dim,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
-    k_cache, v_cache = kv_cache.split(head_dim, dim=-1)
-    block_table = (
-        torch.randperm(num_cache_blocks, device="cuda")
-        .reshape(num_requests, num_pages_per_request)
-        .to(torch.int32)
-    )
-    rows_per_request = math.ceil(num_rows / num_requests)
-    row_indices = torch.arange(num_rows, device="cuda", dtype=torch.int32)
-    token_to_req = row_indices // rows_per_request
-    request_row_counts = torch.tensor(
-        [rows_per_request, num_rows - rows_per_request],
-        device="cuda",
-        dtype=torch.int32,
-    )
+    """One differential case of qsa_sparse_paged_attention vs reference.
 
-    context_length = num_pages_per_request * page_size - 1
-    block_topk = indexer_budget // indexer_compress_ratio
-    compressed_blocks_per_page = page_size // indexer_compress_ratio
-    selection = torch.arange(block_topk, device="cuda")
-    selected_pages = selection % num_selected_pages
-    selected_offsets = selection // num_selected_pages
-    row_shifts = 2 * row_indices.unsqueeze(1)
-    selected_offsets = (selected_offsets + row_shifts) % compressed_blocks_per_page
-    block_indices = (selected_pages * compressed_blocks_per_page + selected_offsets).to(
-        torch.int32
-    )
-    rows_within_request = row_indices % rows_per_request
-    query_positions = (
-        context_length - request_row_counts[token_to_req.long()] + rows_within_request
-    ).to(torch.int64)
-    sequence_lengths = torch.full(
-        (num_requests,), context_length, device="cuda", dtype=torch.int32
-    )
-    logical_indices = qsa_ops.expand_qsa_block_indices_cuda(
-        block_indices,
-        query_positions,
-        sequence_lengths,
-        token_to_req,
-        indexer_compress_ratio,
-        indexer_budget,
-    )
-    assert logical_indices.shape == (num_rows, selection_width)
+    Args:
+        num_rows: query rows (drives the split-K profile dispatch).
+        num_query_heads / num_kv_heads: grouped-query geometry.
+        head_dim: per-head dimension.
+        page_size: KV cache page size.
+        selection_width: logical selection width per row.
+        num_requests: request count driving the block table.
+        invalid_tail: trailing columns of logical_indices set to -1.
+        out_of_range: include indices beyond the block-table width.
 
-    actual = qsa_ops.qsa_sparse_paged_attention(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-    )
-    expected = _qsa_sparse_paged_attention_reference(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        q.shape[-1] ** -0.5,
-    )
-
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
-
-
-def test_qsa_sparse_paged_attention_gated_matches_reference() -> None:
-    """The in-kernel output gate must equal the eager sigmoid multiply.
-
-    Mirrors the numerical contract of the NVIDIA kernel: the attention
-    output is rounded to BF16 first, then gated in FP32.
     """
-    torch.manual_seed(3)
-    num_rows, num_requests = 5, 2
-    context_length = 96
-    num_kv_heads = 1
-    group_size = 4
-    head_dim = 64
-    page_size = 16
-    num_pages = 16
+    torch.manual_seed(num_rows * 31 + num_query_heads + head_dim)
+    pages_per_request = 8
+    num_cache_blocks = num_requests * pages_per_request
     k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim,
+        num_cache_blocks, page_size, num_kv_heads, head_dim,
         dtype=torch.bfloat16, device="cuda",
     )
     v_cache = torch.randn_like(k_cache)
     q = torch.randn(
-        num_rows, num_kv_heads * group_size, head_dim,
+        num_rows, num_query_heads, head_dim,
         dtype=torch.bfloat16, device="cuda",
     )
     gate = torch.randn_like(q)
-    token_to_req = torch.arange(num_rows, device="cuda", dtype=torch.int32) % 2
-    block_table = torch.arange(
-        num_requests * 4, device="cuda", dtype=torch.int32
-    ).reshape(num_requests, 4)
-    logical_indices = torch.randint(
-        0, context_length, (num_rows, 32), device="cuda", dtype=torch.int32
+    token_to_req = (
+        torch.arange(num_rows, device="cuda", dtype=torch.int32) % num_requests
     )
-    logical_indices[:, -3:] = -1
+    block_table = torch.randperm(
+        num_cache_blocks, device="cuda", dtype=torch.int64
+    ).reshape(num_requests, pages_per_request).to(torch.int32)
+    max_logical = pages_per_request * page_size
+    logical_indices = torch.randint(
+        0, max_logical, (num_rows, selection_width), device="cuda",
+        dtype=torch.int32,
+    )
+    if invalid_tail:
+        logical_indices[:, -invalid_tail:] = -1
+    if out_of_range:
+        logical_indices[:, 0] = max_logical + page_size
 
     ungated = qsa_ops.qsa_sparse_paged_attention(
         q, k_cache, v_cache, logical_indices, block_table, token_to_req
     )
+    expected = _qsa_sparse_paged_attention_reference(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
+        q.shape[-1] ** -0.5,
+    )
+    torch.testing.assert_close(ungated, expected, rtol=2e-2, atol=2e-2)
+
     gated = qsa_ops.qsa_sparse_paged_attention(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req,
         output_gate=gate,
     )
-    # The kernel's contract: bf16 round, then fp32 sigmoid gate.
-    expected = (ungated.float() * torch.sigmoid(gate.float())).to(torch.bfloat16)
-    torch.testing.assert_close(gated, expected, rtol=2e-2, atol=2e-2)
+    gated_expected = (expected.float() * torch.sigmoid(gate.float())).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(gated, gated_expected, rtol=2e-2, atol=2e-2)
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("num_rows", "num_kv_heads"),
+    [
+        pytest.param(1, 8, id="profile_tiny"),
+        pytest.param(2, 4, id="profile_8"),
+        pytest.param(3, 8, id="profile_8b"),
+        pytest.param(4, 2, id="profile_8c"),
+        pytest.param(8, 1, id="profile_8_limit"),
+        pytest.param(9, 2, id="profile_32"),
+        pytest.param(16, 1, id="profile_32b"),
+        pytest.param(32, 1, id="profile_32_limit"),
+        pytest.param(33, 1, id="profile_256"),
+        pytest.param(64, 4, id="profile_256b"),
+        pytest.param(128, 2, id="profile_256c"),
+        pytest.param(256, 1, id="profile_256_limit"),
+        pytest.param(257, 1, id="profile_512"),
+        pytest.param(512, 1, id="profile_512_limit"),
+        pytest.param(513, 1, id="profile_prefill"),
+        pytest.param(2048, 1, id="profile_prefill_large"),
+    ],
+)
+def test_qsa_sparse_paged_attention_profile_boundaries(
+    num_rows: int, num_kv_heads: int
+) -> None:
+    _run_sparse_paged_case(
+        num_rows=num_rows,
+        num_query_heads=24,
+        num_kv_heads=num_kv_heads,
+        head_dim=64,
+        page_size=16,
+        selection_width=64,
+    )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads"),
+    [
+        pytest.param(8, 8, id="group1_mqa"),
+        pytest.param(9, 3, id="group3_nonpow2"),
+        pytest.param(24, 1, id="group24"),
+    ],
+)
+def test_qsa_sparse_paged_attention_group_sizes(
+    num_query_heads: int, num_kv_heads: int
+) -> None:
+    _run_sparse_paged_case(
+        num_rows=17,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=64,
+        page_size=16,
+        selection_width=64,
+    )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize("head_dim", [16, 32, 64, 256])
+def test_qsa_sparse_paged_attention_head_dims(head_dim: int) -> None:
+    _run_sparse_paged_case(
+        num_rows=33,
+        num_query_heads=12,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        page_size=16,
+        selection_width=64,
+    )
+
+
+@requires_qsa_kernels
+@pytest.mark.parametrize(
+    "selection_width",
+    [1, 16, 17, 128, 2048],
+    ids=["below_block", "exact_block", "block_plus1", "multi_tile", "deep_splitk"],
+)
+def test_qsa_sparse_paged_attention_selection_widths(selection_width: int) -> None:
+    _run_sparse_paged_case(
+        num_rows=17,
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=64,
+        page_size=16,
+        selection_width=selection_width,
+    )
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_all_invalid_indices() -> None:
+    """All -1 indices produce zero outputs without touching the cache."""
+    torch.manual_seed(11)
+    num_rows, num_kv_heads, head_dim, page_size = 9, 2, 64, 16
+    k_cache = torch.randn(
+        16, page_size, num_kv_heads, head_dim,
+        dtype=torch.bfloat16, device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(
+        num_rows, 8, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    logical_indices = torch.full(
+        (num_rows, 32), -1, dtype=torch.int32, device="cuda"
+    )
+    token_to_req = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    block_table = torch.arange(16, dtype=torch.int32, device="cuda").reshape(1, 16)
+
+    actual = qsa_ops.qsa_sparse_paged_attention(
+        q, k_cache, v_cache, logical_indices, block_table, token_to_req
+    )
+    assert torch.all(actual == 0)
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_out_of_range_indices() -> None:
+    """Indices beyond the block table are masked, matching the reference."""
+    _run_sparse_paged_case(
+        num_rows=9,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=64,
+        page_size=16,
+        selection_width=48,
+        out_of_range=True,
+    )
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_single_request() -> None:
+    """All rows share one request; exercises intra-request gather only."""
+    _run_sparse_paged_case(
+        num_rows=48,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=64,
+        page_size=16,
+        selection_width=64,
+        num_requests=1,
+    )
+
+
+@requires_qsa_kernels
+def test_qsa_sparse_paged_attention_invalid_tail() -> None:
+    """Trailing -1 columns exercise the per-tile validity mask."""
+    _run_sparse_paged_case(
+        num_rows=17,
+        num_query_heads=24,
+        num_kv_heads=4,
+        head_dim=64,
+        page_size=16,
+        selection_width=64,
+        invalid_tail=13,
+    )
