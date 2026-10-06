@@ -108,6 +108,46 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+class _StepPhaseTimer:
+    """Rolling per-phase CPU timing for the engine step loop.
+
+    Enabled by VLLM_STEP_PHASE_TIMING=1; logs rolling medians every
+    ``_LOG_EVERY`` timed steps. Measures wall time of scheduler phases
+    on the engine-core thread (no GPU synchronization).
+    """
+
+    _PHASES = (
+        "schedule",
+        "exec_submit",
+        "exec_wait",
+        "sample",
+        "update_output",
+        "step_total",
+    )
+    _LOG_EVERY = 256
+
+    def __init__(self) -> None:
+        self._samples: dict[str, list[float]] = {p: [] for p in self._PHASES}
+        self._count = 0
+
+    def observe(self, phase: str, seconds: float) -> None:
+        self._samples[phase].append(seconds * 1e6)
+        if phase == "step_total":
+            self._count += 1
+            if self._count % self._LOG_EVERY == 0:
+                self._log()
+
+    def _log(self) -> None:
+        parts = []
+        for phase in self._PHASES:
+            vals = sorted(self._samples[phase])
+            if vals:
+                med = vals[len(vals) // 2]
+                parts.append(f"{phase}={med:.0f}us")
+        logger.info("step-phase-timing: %s", " ".join(parts))
+        self._samples = {p: [] for p in self._PHASES}
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -637,16 +677,32 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        import time as _time
+
+        import vllm.envs as _envs
+
+        if (
+            _envs.VLLM_STEP_PHASE_TIMING
+            and not hasattr(self, "_step_phase_timer")
+        ):
+            self._step_phase_timer = _StepPhaseTimer()
+        _t0 = _time.perf_counter()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        _t1 = _time.perf_counter()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        _t2 = _time.perf_counter()
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
             model_output = future.result()
+            _t3 = _time.perf_counter()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+                _t4 = _time.perf_counter()
+            else:
+                _t4 = _t3
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -655,6 +711,17 @@ class EngineCore:
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        _t5 = _time.perf_counter()
+
+        if getattr(self, "_step_phase_timer", None) is not None:
+            tm = self._step_phase_timer
+            tm.observe("schedule", _t1 - _t0)
+            tm.observe("exec_submit", _t2 - _t1)
+            tm.observe("exec_wait", _t3 - _t2)
+            if _t4 > _t3:
+                tm.observe("sample", _t4 - _t3)
+            tm.observe("update_output", _t5 - _t4 if _t4 > _t3 else _t5 - _t3)
+            tm.observe("step_total", _t5 - _t0)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 

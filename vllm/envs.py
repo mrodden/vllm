@@ -92,7 +92,10 @@ if TYPE_CHECKING:
     VLLM_MAIN_CUDA_VERSION: str = "13.0"
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
-    VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND: Literal["auto", "cute_dsl", "triton", "unfused"] = "auto"
+    VLLM_STEP_PHASE_TIMING: bool = False
+    VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND: (
+        Literal["auto", "cute_dsl", "triton", "unfused"]
+    ) = "auto"
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
@@ -630,6 +633,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    "VLLM_STEP_PHASE_TIMING": lambda: bool(
+        int(os.getenv("VLLM_STEP_PHASE_TIMING", "0"))
+    ),
     "VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND": lambda: str(
         os.getenv("VLLM_QWEN4EXP_HC_DOWN_SILU_BACKEND", "auto")
     ).lower(),
