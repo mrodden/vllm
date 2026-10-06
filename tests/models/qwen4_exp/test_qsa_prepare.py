@@ -423,13 +423,17 @@ def test_qsa_fused_prepare_compress_ratio_sweep(
     is_2d_positions: bool,
     cache_rope_positions: bool,
 ) -> None:
-    """Power-of-2 compress ratios beyond the production value (4)."""
+    """Power-of-2 compress ratios beyond the production value (4).
+
+    The state ring must be at least as wide as the compress ratio (the
+    kernel rejects narrower rings), so state_size scales with it here.
+    """
     test_qsa_fused_prepare_matches_unfused(
         indexer_dtype=torch.bfloat16,
         mrope=mrope,
         is_2d_positions=is_2d_positions,
         cache_rope_positions=cache_rope_positions,
-        state_size=4,
+        state_size=max(4, compress_ratio),
         seq_lens=MIXED_BATCH[0],
         query_lens=MIXED_BATCH[1],
         history_lens=MIXED_BATCH[2],
