@@ -110,7 +110,9 @@ def _store_rotated(dst, y, o1, o2, scale, EMIT_FP8_FNUZ: tl.constexpr):
     HALF: tl.constexpr = o1.shape[0]
     dims = tl.arange(0, y.shape[0])
     rot = tl.arange(0, HALF)
-    tl.store(dst + dims, _to_dst_dtype(y, dst, scale, EMIT_FP8_FNUZ), mask=dims >= 2 * HALF)
+    tl.store(
+        dst + dims, _to_dst_dtype(y, dst, scale, EMIT_FP8_FNUZ), mask=dims >= 2 * HALF
+    )
     tl.store(dst + rot, _to_dst_dtype(o1, dst, scale, EMIT_FP8_FNUZ))
     tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale, EMIT_FP8_FNUZ))
 
