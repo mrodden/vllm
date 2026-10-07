@@ -483,6 +483,18 @@ def _topk(
 ) -> None:
     # similar dispatch logic as DeepSeek indexer
     block_topk = token_topk // compress_ratio
+    if not current_platform.is_cuda():
+        # Neither persistent_topk nor cooperative_topk is compiled into the
+        # ROCm extension; use a torch-native relative top-k over each row's
+        # visible prefix (the same semantics as the test reference).
+        for row in range(logits.shape[0]):
+            length = int(visible_blocks[row])
+            width = min(length, block_topk)
+            if width:
+                block_indices[row, :width] = torch.topk(
+                    logits[row, :length], width
+                ).indices.to(torch.int32)
+        return
     use_cooperative_topk = (
         # The cooperative-groups kernel is CUDA-only (the op is not compiled
         # into the ROCm extension).
