@@ -461,7 +461,10 @@ def test_qsa_fused_prepare_eligibility_gate(
     kernel. Exercises _supports_fused_qsa_prepare, the same predicate
     Qwen4ExpQSAAttention.__init__ consults.
     """
-    import vllm.models.qwen4_exp.amd.model  # noqa: F401  (import order)
+    import sys
+
+    if "vllm.models.qwen4_exp.amd.qsa" not in sys.modules:
+        import vllm.models.qwen4_exp.amd.model  # noqa: F401  (import order)
     from vllm.models.qwen4_exp.amd.qsa import _supports_fused_qsa_prepare
 
     assert (
