@@ -358,7 +358,7 @@ class QSAIndexer(nn.Module):
                 _gemma_norm = _GemmaRMSNorm(
                     self.index_head_dim, eps=self.q_layernorm.variance_epsilon
                 )
-                _gemma_norm = _gemma_norm.to(next(self.parameters()).dtype)
+                _gemma_norm = _gemma_norm.to(self.q_layernorm.weight.dtype)
 
                 def gemma_rmsnorm(x, weight, eps):
                     _gemma_norm.weight.data = weight
