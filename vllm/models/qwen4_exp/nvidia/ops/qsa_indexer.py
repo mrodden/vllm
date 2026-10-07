@@ -484,7 +484,10 @@ def _topk(
     # similar dispatch logic as DeepSeek indexer
     block_topk = token_topk // compress_ratio
     use_cooperative_topk = (
-        logits.shape[0] <= 64
+        # The cooperative-groups kernel is CUDA-only (the op is not compiled
+        # into the ROCm extension).
+        current_platform.is_cuda()
+        and logits.shape[0] <= 64
         and logits.stride(0) % 4 == 0
         and current_platform.has_device_capability(90)
         and not current_platform.is_device_capability_family(120)
