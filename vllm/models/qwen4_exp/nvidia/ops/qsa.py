@@ -559,7 +559,25 @@ def _select_config(
     and sm_90 (Hopper) to _select_sm90_config.
     """
     base_programs = num_rows * num_kv_heads
-    if _is_sm120():
+    if current_platform.is_rocm():
+        # gfx942 has 64 KiB LDS per workgroup; the CUDA tables' BLOCK_N=64
+        # x num_stages=2 configs need 66560 B and overflow. Keep BLOCK_N=32
+        # everywhere and halve the split counts of the large-program tiers.
+        if base_programs > 2048:
+            BLOCK_N, target_splits, num_warps = (32, 1, 1)
+        elif base_programs <= 24:
+            BLOCK_N, target_splits, num_warps = 32, 32, 4
+        elif base_programs <= 32:
+            BLOCK_N, target_splits, num_warps = 32, 8, 1
+        elif base_programs <= 64 or base_programs <= 128:
+            BLOCK_N, target_splits, num_warps = 32, 4, 1
+        elif base_programs <= 256:
+            BLOCK_N, target_splits, num_warps = 32, 8, 1
+        elif base_programs <= 512:
+            BLOCK_N, target_splits, num_warps = 32, 2, 2
+        else:
+            BLOCK_N, target_splits, num_warps = 32, 1, 2
+    elif _is_sm120():
         BLOCK_N, target_splits, num_warps = _select_sm120_config(
             base_programs, use_prefill_config, is_fp8
         )
