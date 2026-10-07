@@ -34,8 +34,9 @@ LORA_RANK = 320
 DOWN_N = LORA_RANK + HC + 12  # merged down+inject weight, 16-row padded
 
 requires_sm90 = pytest.mark.skipif(
-    not current_platform.has_device_capability(90),
-    reason="fused HC down+SiLU requires SM90+",
+    not current_platform.is_cuda()
+    or not current_platform.has_device_capability(90),
+    reason="fused HC down+SiLU (cute_dsl) requires CUDA SM90+",
 )
 
 
@@ -261,6 +262,11 @@ with set_current_vllm_config(VllmConfig()):
     pstate.init_distributed_environment(backend="gloo")
     pstate.initialize_model_parallel(tensor_model_parallel_size=1)
     m = mod.GatedResidual(cfg, use_combine=True, prefix="test_hc").to("cuda")
+    # ModelWeightParameter tensors are torch.empty (filled at checkpoint load);
+    # zero them so the comparison runs on finite values on any allocator.
+    with torch.no_grad():
+        for p_ in m.parameters(recurse=True):
+            p_.zero_()
     torch.manual_seed(0)
     xn = torch.randn(
         {num_tokens}, {HYPER_HIDDEN_SIZE}, dtype=torch.bfloat16, device="cuda"
