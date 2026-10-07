@@ -4,7 +4,12 @@
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+# Whether FP8 stores must land in the FNUZ code space (the ROCm platform
+# convention; gfx942 hardware conversion) rather than OCP e4m3 codes.
+_EMIT_FP8_FNUZ = current_platform.is_rocm()
 
 
 @triton.jit
@@ -81,24 +86,33 @@ def _norm_rope(
 
 
 @triton.jit
-def _to_dst_dtype(x, dst, scale):
+def _to_dst_dtype(x, dst, scale, EMIT_FP8_FNUZ: tl.constexpr):
     """Round to BF16 like the unfused path, then scale for an FP8 destination."""
     out_ty = dst.dtype.element_ty
     x = x.to(tl.bfloat16)
     if out_ty == tl.float8e4nv:
         x = x.to(tl.float32) / scale
+        # Triton's float8e4nv casts emit OCP e4m3 codes on every backend,
+        # but the ROCm C++ cache ops (and vLLM's ROCm platform convention)
+        # use FNUZ e4m3 codes: a FNUZ code decodes as half the OCP value
+        # of the same bits (exponent bias 6 vs 7). The FNUZ code for a
+        # value v is therefore the OCP code of 2v, so pre-scale by 2 on
+        # ROCm to land in the platform's code space. Saturation differs
+        # only above the FNUZ max (240), which the cache scales avoid.
+        if EMIT_FP8_FNUZ:
+            x = x * 2.0
     return x.to(out_ty)
 
 
 @triton.jit
-def _store_rotated(dst, y, o1, o2, scale):
+def _store_rotated(dst, y, o1, o2, scale, EMIT_FP8_FNUZ: tl.constexpr):
     """Store a normalized head whose first ``2 * len(o1)`` dims are rotated."""
     HALF: tl.constexpr = o1.shape[0]
     dims = tl.arange(0, y.shape[0])
     rot = tl.arange(0, HALF)
-    tl.store(dst + dims, _to_dst_dtype(y, dst, scale), mask=dims >= 2 * HALF)
-    tl.store(dst + rot, _to_dst_dtype(o1, dst, scale))
-    tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale))
+    tl.store(dst + dims, _to_dst_dtype(y, dst, scale, EMIT_FP8_FNUZ), mask=dims >= 2 * HALF)
+    tl.store(dst + rot, _to_dst_dtype(o1, dst, scale, EMIT_FP8_FNUZ))
+    tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale, EMIT_FP8_FNUZ))
 
 
 @triton.jit(
@@ -110,6 +124,7 @@ def _store_rotated(dst, y, o1, o2, scale):
     ]
 )
 def _qsa_prepare_kernel(
+    EMIT_FP8_FNUZ: tl.constexpr,
     q_ptr,
     q_stride_token,
     k_ptr,
@@ -224,12 +239,15 @@ def _qsa_prepare_kernel(
                     + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
+                _store_rotated(dst, y, o1, o2, main_k_scale, EMIT_FP8_FNUZ)
                 v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                tl.store(
+                    dst + MAIN_D + dims,
+                    _to_dst_dtype(v, dst, main_v_scale, EMIT_FP8_FNUZ),
+                )
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
-            _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
+            _store_rotated(main_q_out_ptr + out, y, o1, o2, None, EMIT_FP8_FNUZ)
             gate = tl.load(src + MAIN_D + dims)
             tl.store(main_gate_out_ptr + out + dims, gate)
         return
@@ -581,6 +599,7 @@ def qsa_prepare(
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
     num_main_work = num_tokens * (num_main_q_heads + num_main_kv_heads)
     _qsa_prepare_kernel[(num_k_work + num_q_work + num_main_work,)](
+        _EMIT_FP8_FNUZ,
         q,
         q.stride(0),
         k,

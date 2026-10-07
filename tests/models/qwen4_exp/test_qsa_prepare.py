@@ -34,6 +34,13 @@ COMP_PAGE = BLOCK_SIZE // CR
 ROPE_POS_OFFSET = D
 RTOL = 1.6e-2
 ATOL = 1e-2
+# The main-attention cache dtype follows the platform convention: the ROCm
+# C++ cache ops emit FNUZ codes (gfx942 hardware conversion; OCP e4m3
+# arrives with gfx950), while CUDA uses OCP e4m3fn. Match the view dtype
+# to what the reference reshape_and_cache_flash actually writes.
+FP8_CACHE_DTYPE = (
+    torch.float8_e4m3fnuz if current_platform.is_rocm() else torch.float8_e4m3fn
+)
 MIXED_BATCH = ([260, 259, 138], [1, 1, 37], [8, 8, 8])
 MAIN_HQ, MAIN_HK, MAIN_D, MAIN_PAGE = 6, 2, 256, 16
 
@@ -85,7 +92,7 @@ def _make_main_inputs(num_tokens: int, fp8_cache: bool) -> dict:
         main_q_norm_weight=norm_weights[0],
         main_k_norm_weight=norm_weights[1],
         main_eps=EPS,
-        main_kv_cache=cache.view(torch.float8_e4m3fn) if fp8_cache else cache,
+        main_kv_cache=cache.view(FP8_CACHE_DTYPE) if fp8_cache else cache,
         main_slot_mapping=slots,
         main_k_scale=0.5,
         main_v_scale=2.0,
@@ -118,7 +125,7 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
         norm_beta=1.0,
     )
     kv_cache = main["main_kv_cache"]
-    fp8_cache = kv_cache.dtype == torch.float8_e4m3fn
+    fp8_cache = kv_cache.dtype == FP8_CACHE_DTYPE
     cache = torch.zeros_like(kv_cache.view(torch.uint8) if fp8_cache else kv_cache)
     key_cache, value_cache = cache.split(MAIN_D, dim=-1)
     reshape_and_cache_flash(
@@ -134,7 +141,7 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
     assert torch.equal(gate_out.flatten(1), gate)
     if fp8_cache:
-        assert_fp8_within_one_ulp(kv_cache, cache.view(torch.float8_e4m3fn))
+        assert_fp8_within_one_ulp(kv_cache, cache.view(FP8_CACHE_DTYPE))
     else:
         torch.testing.assert_close(kv_cache, cache, rtol=RTOL, atol=ATOL)
 
