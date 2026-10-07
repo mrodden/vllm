@@ -349,19 +349,22 @@ def _qsa_prepare_kernel(
                 + safe_state_block * state_cache_stride_block
                 + (source_positions % STATE_SIZE)[:, None] * state_cache_stride_token
             )
-            # Only the first completed group can cross the chunk boundary. Select
-            # historical rows from the ring without issuing two masked loads.
-            source_base = tl.where(source_in_chunk[:, None], current_base, cached_base)
-            # Pointer selection obscures alignment from Triton's analysis.
-            source_base = tl.multiple_of(source_base, (8, 8))
-            source_valid = tl.where(
-                source_in_chunk, source_tokens_valid, state_block_valid
-            )
-            source = tl.load(
-                source_base + dims[None, :],
-                mask=valid & source_valid[:, None],
+            # Only the first completed group can cross the chunk boundary. so
+            # select historical rows from the ring. Pointer-valued tl.where
+            # crashes the ROCm Triton backend's pointer canonicalization
+            # (gfx942, triton 3.7.1), so issue two masked loads and select
+            # the values instead of the pointers.
+            current = tl.load(
+                current_base + dims[None, :],
+                mask=valid & source_tokens_valid[:, None],
                 other=0.0,
             ).to(tl.float32)
+            cached = tl.load(
+                cached_base + dims[None, :],
+                mask=valid & state_block_valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            source = tl.where(source_in_chunk[:, None], current, cached)
             # Match the unfused path's BF16 pooled tensor before RMSNorm.
             pooled = (
                 (tl.sum(source, axis=0) / COMPRESS_RATIO).to(tl.bfloat16).to(tl.float32)
