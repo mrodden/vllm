@@ -6,16 +6,20 @@ import importlib
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu import hc_down_silu
-from vllm.models.qwen4_exp.nvidia.ops.hc import (
-    grouped_gemma_rmsnorm,
-    hc_combine,
-    hc_combine_norm,
-    hc_gate_mix,
-    hc_silu,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
+
+
+def _nv_hc_ops():
+    """Lazily import the NVIDIA hc ops.
+
+    The amd and nvidia op modules register shared custom-op names; a
+    module-level import here collides when another test file (e.g.
+    test_qsa_amd) imports the amd model in the same process.
+    """
+    import vllm.models.qwen4_exp.nvidia.ops.hc as nv_hc
+
+    return nv_hc
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda() or not HAS_TRITON,
@@ -36,6 +40,7 @@ requires_sm90 = pytest.mark.skipif(
 
 
 def test_grouped_gemma_rmsnorm() -> None:
+    grouped_gemma_rmsnorm = _nv_hc_ops().grouped_gemma_rmsnorm
     torch.manual_seed(0)
     x = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
@@ -50,6 +55,7 @@ def test_grouped_gemma_rmsnorm() -> None:
 
 
 def test_hc_gate_mix() -> None:
+    hc_gate_mix = _nv_hc_ops().hc_gate_mix
     torch.manual_seed(0)
     x = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     gate = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
@@ -64,6 +70,7 @@ def test_hc_gate_mix() -> None:
 
 
 def test_hc_combine() -> None:
+    hc_combine = _nv_hc_ops().hc_combine
     torch.manual_seed(0)
     block_output = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     residual = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
@@ -80,6 +87,7 @@ def test_hc_combine() -> None:
 
 
 def test_hc_combine_unit_injection() -> None:
+    hc_combine = _nv_hc_ops().hc_combine
     torch.manual_seed(0)
     block_output = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     residual = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
@@ -92,6 +100,7 @@ def test_hc_combine_unit_injection() -> None:
 
 
 def test_hc_combine_norm() -> None:
+    hc_combine_norm = _nv_hc_ops().hc_combine_norm
     torch.manual_seed(0)
     block_output = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     residual = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
@@ -119,6 +128,8 @@ def test_hc_combine_norm() -> None:
 
 @pytest.mark.parametrize("num_tokens", [1, 17, 2048])
 def test_hc_combine_norm_unit_injection(num_tokens: int) -> None:
+    hc_combine_norm = _nv_hc_ops().hc_combine_norm
+    grouped_gemma_rmsnorm = _nv_hc_ops().grouped_gemma_rmsnorm
     torch.manual_seed(0)
     embedding = torch.randn(
         num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda"
@@ -147,6 +158,7 @@ def test_hc_down_silu_triton(num_tokens: int) -> None:
     """
     from vllm.models.qwen4_exp.common.hc_down_silu import hc_down_silu as triton_fused
 
+    hc_silu = _nv_hc_ops().hc_silu
     torch.manual_seed(0)
     x = torch.randn(num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
     weight = torch.randn(DOWN_N, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
@@ -171,6 +183,7 @@ def test_hc_down_silu_triton_shape_sweep(lora_rank: int, hc_count: int) -> None:
     """
     from vllm.models.qwen4_exp.common.hc_down_silu import hc_down_silu as triton_fused
 
+    hc_silu = _nv_hc_ops().hc_silu
     for num_tokens in (1, 17, 48):
         for down_n in (lora_rank + hc_count, lora_rank + hc_count + 12):
             torch.manual_seed(lora_rank * 100 + hc_count + num_tokens + down_n)
@@ -285,6 +298,9 @@ print("OK")
 def test_hc_down_silu_fused(num_tokens: int) -> None:
     # Compare computed columns with the unfused ll_bf16 + hc_silu reference.
     from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import ll_bf16_gemm
+    from vllm.models.qwen4_exp.nvidia.ops.cute_dsl.hc_down_silu import hc_down_silu
+
+    hc_silu = _nv_hc_ops().hc_silu
 
     torch.manual_seed(0)
     x = torch.randn(num_tokens, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
