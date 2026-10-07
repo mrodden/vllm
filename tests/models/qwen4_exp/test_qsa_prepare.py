@@ -175,14 +175,14 @@ def test_qsa_fused_prepare_matches_unfused(
     history_lens,
     compress_ratio=CR,
 ) -> None:
-    try:
+    # flashinfer JIT-compiles CUDA extensions at call time; on ROCm use
+    # vLLM's portable Gemma RMSNorm for the unfused reference instead.
+    if current_platform.is_cuda():
         from flashinfer.norm import gemma_rmsnorm
-    except (ImportError, RuntimeError):
-        # flashinfer JIT-compiles CUDA extensions; on ROCm fall back to
-        # vLLM's portable Gemma RMSNorm for the unfused reference.
+    else:
         from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 
-        _norm = GemmaRMSNorm(1, eps=1e-6)  # eps/weight passed per call below
+        _norm = GemmaRMSNorm(1, eps=1e-6)
 
         def gemma_rmsnorm(x, weight, eps):
             _norm.weight = weight
