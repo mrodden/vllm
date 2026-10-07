@@ -185,7 +185,7 @@ def test_qsa_fused_prepare_matches_unfused(
         _norm = GemmaRMSNorm(1, eps=1e-6)
 
         def gemma_rmsnorm(x, weight, eps):
-            _norm.weight = weight
+            _norm.weight.data = weight
             _norm.variance_epsilon = eps
             return _norm.forward_native(x)
 
