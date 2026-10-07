@@ -487,6 +487,7 @@ def _topk(
         # Neither persistent_topk nor cooperative_topk is compiled into the
         # ROCm extension; use a torch-native relative top-k over each row's
         # visible prefix (the same semantics as the test reference).
+        block_indices.fill_(-1)
         for row in range(logits.shape[0]):
             length = int(visible_blocks[row])
             width = min(length, block_topk)

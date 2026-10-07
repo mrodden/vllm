@@ -803,6 +803,26 @@ def test_qsa_decode_selection_correctness(
             )
         return
 
+    if current_platform.is_rocm():
+        # The triton scoring kernel and the torch reference matmul use
+        # different bf16 accumulation orders, which flips near-tied
+        # entries at the top-k boundary; compare selected value multisets
+        # (the same comparison the fp8 branch uses).
+        logits = _qsa_mqa_paged_reference(
+            q, cache, page_table, token_to_req, visible_blocks
+        )
+        for row in range(rows):
+            selected = actual[row][actual[row] >= 0]
+            wanted = expected[row][expected[row] >= 0]
+            assert selected.numel() == wanted.numel()
+            torch.testing.assert_close(
+                logits[row, selected.long()].sort().values,
+                logits[row, wanted.long()].sort().values,
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        return
+
     torch.testing.assert_close(actual.sort().values, expected.sort().values)
 
 
