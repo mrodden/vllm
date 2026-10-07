@@ -23,6 +23,7 @@ def is_available() -> bool:
     try:
         import cutlass  # noqa: F401
         import cutlass.cute  # noqa: F401
+        import quack  # noqa: F401
 
         _cutedsl_available = True
     except ImportError:
