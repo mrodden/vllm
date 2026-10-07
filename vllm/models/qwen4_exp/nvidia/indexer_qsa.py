@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp weight-free QSA indexer."""
-
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -14,6 +13,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.platforms import current_platform
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -53,7 +53,12 @@ def apply_qsa_rope(
         )
         return tensor.reshape(shape)
 
-    rotated = rotary_emb.apply_rotary_emb.forward_cuda(
+    rotary_fn = (
+        rotary_emb.apply_rotary_emb.forward_cuda
+        if current_platform.is_cuda()
+        else rotary_emb.apply_rotary_emb.forward_native
+    )
+    rotated = rotary_fn(
         tensor[..., :rotary_dim],
         cos,
         sin,
