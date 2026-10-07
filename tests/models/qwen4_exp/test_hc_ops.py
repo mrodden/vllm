@@ -22,7 +22,7 @@ def _nv_hc_ops():
     return nv_hc
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda() or not HAS_TRITON,
+    not current_platform.is_cuda_alike() or not HAS_TRITON,
     reason="HC kernels require CUDA and Triton",
 )
 

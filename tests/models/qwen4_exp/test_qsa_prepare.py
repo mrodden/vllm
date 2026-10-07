@@ -21,7 +21,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 requires_qsa_kernels = pytest.mark.skipif(
-    not current_platform.is_cuda() or not HAS_TRITON,
+    not current_platform.is_cuda_alike() or not HAS_TRITON,
     reason="QSA kernels require CUDA and Triton",
 )
 
