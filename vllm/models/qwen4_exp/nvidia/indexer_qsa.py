@@ -346,8 +346,24 @@ class QSAIndexer(nn.Module):
                 main_v_scale=attn._v_scale_float,
             )
         else:
-            # Unfused reference path
-            from flashinfer.norm import gemma_rmsnorm
+            # Unfused reference path. flashinfer's norm JIT-compiles CUDA
+            # extensions; use vLLM's portable Gemma RMSNorm on ROCm.
+            if current_platform.is_cuda():
+                from flashinfer.norm import gemma_rmsnorm
+            else:
+                from vllm.model_executor.layers.layernorm import (
+                    GemmaRMSNorm as _GemmaRMSNorm,
+                )
+
+                _gemma_norm = _GemmaRMSNorm(
+                    self.index_head_dim, eps=self.q_layernorm.variance_epsilon
+                )
+                _gemma_norm = _gemma_norm.to(next(self.parameters()).dtype)
+
+                def gemma_rmsnorm(x, weight, eps):
+                    _gemma_norm.weight.data = weight
+                    _gemma_norm.variance_epsilon = eps
+                    return _gemma_norm.forward_native(x)
 
             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
             q = gemma_rmsnorm(
