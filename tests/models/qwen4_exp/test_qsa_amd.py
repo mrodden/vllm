@@ -423,3 +423,154 @@ def test_qsa_sparse_paged_attention_invalid_tail() -> None:
         selection_width=64,
         invalid_tail=13,
     )
+
+
+class _RecordingImpl:
+    """Attention impl double that records the main-cache update contract."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.forward_gate: torch.Tensor | None = None
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        self.calls.append("kv_update")
+        for i, slot in enumerate(slot_mapping.tolist()):
+            if slot >= 0:
+                kv_cache[slot, 0] = key[i]
+                kv_cache[slot, 1] = value[i]
+
+    def forward_qsa(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        *,
+        token_to_req,
+        output_gate,
+    ):
+        self.calls.append("forward_qsa")
+        self.forward_gate = output_gate
+
+
+class _IndexerStub:
+    """Indexer double returning the selection buffer, plus fused main
+    outputs (query, gate) only when constructed in fused mode."""
+
+    def __init__(self, prefix: str, output_width: int, fused: bool) -> None:
+        self.raw_key_cache = SimpleNamespace(prefix=prefix)
+        self.output_width = output_width
+        self.fused = fused
+
+    def __call__(self, projected_qk, positions, out, *, attn, qkv, slot_mapping):
+        out.zero_()
+        if self.fused:
+            num_tokens = out.shape[0]
+            query = torch.full(
+                (num_tokens, 2, 32), 7.0, dtype=torch.bfloat16, device=out.device
+            )
+            gate = torch.full(
+                (num_tokens, 2, 32), -3.0, dtype=torch.bfloat16, device=out.device
+            )
+            return out, (query, gate)
+        return out, None
+
+
+def _run_qsa_with_stub_owner(fused: bool) -> SimpleNamespace:
+    """Drive Qwen4ExpQSAAttention._run_qsa against stubbed collaborators."""
+    from vllm.config import VllmConfig
+    from vllm.forward_context import set_forward_context
+    from vllm.models.qwen4_exp.amd.qsa import Qwen4ExpQSAAttention
+
+    device = torch.device("cuda")
+    num_tokens, num_kv_heads, head_dim = 5, 1, 64
+    layer_name = "model.layers.0.self_attn"
+    raw_prefix = "model.layers.0.ple.ple_embedding"
+
+    # Token 0 maps to slot -1 (no write); tokens 1..4 map to slots 1,2,3,0,
+    # leaving cache row 4 untouched.
+    slot_mapping = torch.tensor([-1, 1, 2, 3, 0], device=device)
+    main_metadata = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        slot_mapping=slot_mapping,
+    )
+    side_metadata = SimpleNamespace(
+        num_actual_tokens=num_tokens,
+        token_to_req=torch.zeros(num_tokens, dtype=torch.int32, device=device),
+    )
+
+    kv_cache = torch.zeros(
+        5, 2, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    impl = _RecordingImpl()
+    owner = SimpleNamespace(
+        layer_name=layer_name,
+        kv_cache=kv_cache,
+        indexer=_IndexerStub(raw_prefix, 8, fused=fused),
+        topk_indices_buffer=torch.zeros(32, 8, dtype=torch.int32, device=device),
+        impl=impl,
+    )
+    key = (
+        torch.arange(num_tokens * num_kv_heads * head_dim, dtype=torch.float32)
+        .reshape(num_tokens, num_kv_heads, head_dim)
+        .to(torch.bfloat16)
+        .to(device)
+    )
+    value = -key
+    query = key.clone()
+    output = torch.zeros(num_tokens, 2 * 32, dtype=torch.bfloat16, device=device)
+
+    with set_forward_context(
+        {layer_name: main_metadata, raw_prefix: side_metadata}, VllmConfig()
+    ):
+        Qwen4ExpQSAAttention._run_qsa(
+            owner,
+            torch.zeros(num_tokens, 8, device=device),
+            torch.zeros(num_tokens, dtype=torch.long, device=device),
+            query,
+            key,
+            value,
+            output,
+        )
+    return SimpleNamespace(impl=impl, kv_cache=kv_cache, key=key, value=value)
+
+
+def test_qsa_unfused_run_qsa_writes_main_kv_cache() -> None:
+    """Regression: the unfused _run_qsa branch must update the main K/V cache.
+
+    The fused QSA prepare wiring (4cc5178815) moved the main K/V cache
+    write into the indexer's fused launch and dropped the unfused-path
+    do_kv_cache_update call. On CUDA the fused gate is always true so the
+    unfused branch never runs there, but on ROCm it is the only path —
+    every serve ran QSA attention against an unwritten paged cache
+    (fixed in 328c1744f5). Guards the unfused orchestration contract:
+    no fused main outputs means the impl writes the caller's key/value
+    at the metadata's slot mapping.
+    """
+    res = _run_qsa_with_stub_owner(fused=False)
+    assert res.impl.calls == ["kv_update", "forward_qsa"]
+    assert res.impl.forward_gate is None
+    # Slots [-1, 1, 2, 3, 0]: tokens 1..4 land in cache rows 1, 2, 3, 0.
+    torch.testing.assert_close(res.kv_cache[[1, 2, 3, 0], 0], res.key[1:])
+    torch.testing.assert_close(res.kv_cache[[1, 2, 3, 0], 1], res.value[1:])
+    # The padded token's slot (-1) and the untouched row 4 stay zero.
+    torch.testing.assert_close(res.kv_cache[4], torch.zeros_like(res.kv_cache[4]))
+
+
+def test_qsa_fused_run_qsa_skips_main_kv_cache_update() -> None:
+    """The fused branch must not double-write the main K/V cache.
+
+    When the indexer's fused prepare returns main outputs, the K/V write
+    already happened inside that launch and do_kv_cache_update must be
+    skipped; the prepare's gate flows to the attention kernel directly.
+    """
+    res = _run_qsa_with_stub_owner(fused=True)
+    assert res.impl.calls == ["forward_qsa"]
+    assert res.impl.forward_gate is not None
+    torch.testing.assert_close(
+        res.impl.forward_gate, torch.full_like(res.impl.forward_gate, -3.0)
+    )
+    torch.testing.assert_close(res.kv_cache, torch.zeros_like(res.kv_cache))
