@@ -434,6 +434,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             # exactly num_actual_tokens rows), skipping the padded
             # caller-side gate_out buffer entirely.
             query, fused_gate = main_outputs
+        else:
+            # Unfused path: write the main K/V into the paged cache here;
+            # the fused prepare branch does it inside its launch.
+            assert key is not None and value is not None
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
         if query is None:
             raise RuntimeError("QSA owner did not produce Q and gate")
         impl.forward_qsa(
