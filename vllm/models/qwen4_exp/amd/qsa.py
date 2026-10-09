@@ -57,7 +57,7 @@ from .indexer_qsa import QSAIndexer
 
 
 def _supports_fused_qsa_prepare(
-    use_fused_qk_norm_rope_gate: bool,
+    rotary_emb: nn.Module,
     index_head_dim: int,
     rotary_dim: int,
     index_kv_heads: int,
@@ -65,11 +65,24 @@ def _supports_fused_qsa_prepare(
 ) -> bool:
     """Eligibility for the single-launch fused QSA prepare.
 
-    The fused triton kernel supports head_dim 128 with rotary_dim 64,
-    one indexer K/V head, and power-of-2 compress ratios only.
+    Shape and rope checks mirror the NVIDIA path's
+    _supports_fused_pre_indexer; the kernel is platform-neutral triton.
+    The main QK-norm/RoPE/gate runs inside the launch, so this does not
+    depend on use_fused_qk_norm_rope_gate (whose fused projection kernel
+    is the piece that stays CUDA-only).
     """
+    mrope_section = getattr(rotary_emb, "mrope_section", None)
     return (
-        use_fused_qk_norm_rope_gate
+        bool(getattr(rotary_emb, "is_neox_style", False))
+        and (
+            not mrope_section
+            or (
+                len(mrope_section) == 3
+                and sum(mrope_section) == rotary_dim // 2
+                and bool(getattr(rotary_emb, "mrope_interleaved", False))
+            )
+        )
+        and getattr(rotary_emb, "dtype", None) in (torch.float16, torch.bfloat16)
         and index_head_dim == 128
         and rotary_dim == 64
         and index_kv_heads == 1
@@ -342,7 +355,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # them take separate kernels. Mirrors the NVIDIA path's
         # _supports_fused_pre_indexer shape checks.
         self.use_fused_qsa_prepare = _supports_fused_qsa_prepare(
-            self.use_fused_qk_norm_rope_gate,
+            self.rotary_emb,
             self.indexer.index_head_dim,
             int(self.rotary_emb.rotary_dim),
             self.indexer.index_kv_heads,

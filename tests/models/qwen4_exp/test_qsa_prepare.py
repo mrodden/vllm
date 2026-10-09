@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness tests for the fused QSA prepare kernel."""
 
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -486,13 +487,59 @@ def test_qsa_fused_prepare_eligibility_gate(
         import vllm.models.qwen4_exp.amd.model  # noqa: F401  (import order)
     from vllm.models.qwen4_exp.amd.qsa import _supports_fused_qsa_prepare
 
+    rotary_emb = SimpleNamespace(
+        is_neox_style=True,
+        mrope_section=None,
+        dtype=torch.bfloat16,
+    )
     assert (
         _supports_fused_qsa_prepare(
-            use_fused_qk_norm_rope_gate=True,
+            rotary_emb,
             index_head_dim=128,
             rotary_dim=64,
             index_kv_heads=1,
             compress_ratio=compress_ratio,
+        )
+        is eligible
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "eligible"),
+    [
+        pytest.param("is_neox_style", False, False, id="non_neox"),
+        pytest.param("dtype", torch.float32, False, id="fp32_rope"),
+    ],
+)
+def test_qsa_fused_prepare_rope_eligibility(
+    field: str, value: object, eligible: bool
+) -> None:
+    """The fused prepare requires neox-style rope in fp16/bf16.
+
+    Mirrors the rope checks the NVIDIA path's _supports_fused_pre_indexer
+    applies; the predicate no longer depends on the CUDA-only
+    use_fused_qk_norm_rope_gate, so these are what keeps ineligible rope
+    configurations on the unfused path.
+    """
+    import sys
+
+    if "vllm.models.qwen4_exp.amd.qsa" not in sys.modules:
+        import vllm.models.qwen4_exp.amd.model  # noqa: F401  (import order)
+    from vllm.models.qwen4_exp.amd.qsa import _supports_fused_qsa_prepare
+
+    rotary_emb = SimpleNamespace(
+        is_neox_style=True,
+        mrope_section=None,
+        dtype=torch.bfloat16,
+    )
+    setattr(rotary_emb, field, value)
+    assert (
+        _supports_fused_qsa_prepare(
+            rotary_emb,
+            index_head_dim=128,
+            rotary_dim=64,
+            index_kv_heads=1,
+            compress_ratio=4,
         )
         is eligible
     )
