@@ -149,7 +149,33 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
 
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
-@pytest.mark.parametrize("indexer_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+# vLLM's C++ reshape_and_cache_flash (the main-cache reference below) writes
+# OCP e4m3fn codes into float8_e4m3fnuz-typed caches on gfx950: its codes
+# decode as exact e4m3fn encodings of the same values, one exponent-bias
+# step (8 code steps) off from the fnuz codes the tensor dtype requires.
+# The fused triton kernel writes correct fnuz codes there (verified against
+# torch's own fnuz semantics), so the reference comparison is invalid on
+# gfx950 until the upstream op is fixed. strict=True so an upstream fix
+# surfaces as an XPASS.
+@pytest.mark.parametrize(
+    "indexer_dtype",
+    [
+        torch.bfloat16,
+        pytest.param(
+            torch.float8_e4m3fn,
+            marks=[
+                pytest.mark.xfail(
+                    current_platform.is_rocm()
+                    and torch.cuda.get_device_capability() == (9, 5),
+                    reason="C++ reshape_and_cache_flash emits OCP e4m3fn "
+                    "codes for fnuz-typed caches on gfx950; the triton "
+                    "side is correct",
+                    strict=True,
+                )
+            ],
+        ),
+    ],
+)
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
